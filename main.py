@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException, Depends, status
 from pydantic import BaseModel
 from databases import Database
 import re
+from fastapi import Query, HTTPException
+
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta
@@ -71,6 +73,8 @@ class VaccineScheduleCreate(BaseModel):
     dose_number: int
     recommended_age_months: int
     mandatory: bool
+    description: str  # Add vaccine description here
+    benefits: str
 class ImmunizationSummaryResponse(BaseModel):
     child_id: int
     first_name: str
@@ -155,11 +159,15 @@ async def shutdown():
     await database.disconnect()
 
 class UpcomingVaccine(BaseModel):
+    child_id: int
+    schedule_id: int
     first_name: str
     last_name: str
     vaccine_name: str
     dose_number: int
-    due_date: str  # rename here
+    due_date: str
+    appointment_booked: bool  # ✅ Add this line
+
 
 @app.post("/signup", status_code=201)
 async def signup(child: ChildCreate):
@@ -220,7 +228,7 @@ async def fetch_summaries(current_user=Depends(get_current_user)):
     ORDER BY startedAt DESC
     """
     results = await database.fetch_all(query=query, values={"child_id": current_user["child_id"]})
-
+    print(results)
     # Convert datetime to string if needed
     summaries = []
     for row in results:
@@ -275,7 +283,6 @@ def months_between(start_date, end_date):
 
 @app.get("/upcoming-vaccines", response_model=List[UpcomingVaccine])
 async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
-    # 1. Fetch child's DOB
     query_dob = "SELECT date_of_birth, first_name, last_name FROM Children WHERE child_id = :child_id"
     child = await database.fetch_one(query=query_dob, values={"child_id": current_user["child_id"]})
     if not child:
@@ -287,44 +294,49 @@ async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
 
     today = datetime.utcnow().date()
     age_in_months = months_between(dob.date(), today)
-
-    # 2. Calculate age range for upcoming vaccines in next 30 days
-    # Approximate one month as 30 days
     upcoming_age_start = age_in_months
     upcoming_age_end = age_in_months + 1
 
-    # 3. Fetch vaccine schedules where recommended age is between upcoming_age_start and upcoming_age_end
     query_schedule = """
-    SELECT vaccine_name, dose_number, recommended_age_months, mandatory
+    SELECT schedule_id, vaccine_name, dose_number, recommended_age_months, mandatory
     FROM VaccineSchedule
     WHERE recommended_age_months BETWEEN :start_age AND :end_age
     ORDER BY recommended_age_months
     """
     schedules = await database.fetch_all(query=query_schedule, values={"start_age": upcoming_age_start, "end_age": upcoming_age_end})
 
-    if not schedules:
-        return []
-
-    schedules = [dict(s) for s in schedules]
-
-    # 4. Fetch vaccines already taken by the child
     query_taken = """
     SELECT vaccine_name, dose_number FROM VaccinationTakenRecords WHERE child_id = :child_id
     """
     taken_records = await database.fetch_all(query=query_taken, values={"child_id": current_user["child_id"]})
     taken_set = {(r["vaccine_name"], r["dose_number"]) for r in taken_records}
 
-    # 5. Filter out vaccines already taken
-    return [
-        {
+    query_appointments = """
+    SELECT schedule_id FROM Appointments WHERE child_id = :child_id
+    """
+    appointment_rows = await database.fetch_all(query=query_appointments, values={"child_id": current_user["child_id"]})
+    appointment_ids = {r["schedule_id"] for r in appointment_rows}
+
+    result = []
+    for s in schedules:
+        if (s["vaccine_name"], s["dose_number"]) in taken_set:
+            continue
+        due_date = (dob + relativedelta(months=+s["recommended_age_months"])).date().isoformat()
+        result.append({
+            "child_id": current_user["child_id"],
+            "schedule_id": s["schedule_id"],
             "first_name": first_name,
             "last_name": last_name,
             "vaccine_name": s["vaccine_name"],
-            "dose_number": s["dose_number"],  # Empty string instead of None
-            "due_date": (dob + relativedelta(months=+s["recommended_age_months"])).date().isoformat()
-        }
-        for s in schedules if (s["vaccine_name"], s["dose_number"]) not in taken_set
-    ]
+            "dose_number": s["dose_number"],
+            "due_date": due_date,
+            "appointment_booked": s["schedule_id"] in appointment_ids
+        })
+
+    return result
+
+
+
 
 
 @app.get("/child/nearby-providers", response_model=List[Provider])
@@ -762,10 +774,11 @@ async def add_vaccine_schedule(
 schema = {
     "Children": ["child_id", "first_name", "last_name", "date_of_birth", "gender", "blood_type", "pincode"],
     "VaccinationTakenRecords": ["record_id", "child_id", "vaccine_name", "dose_number", "date_administered", "administered_by", "reminder_sent", "notes"],
-    "VaccineSchedule": ["schedule_id", "vaccine_name", "dose_number", "recommended_age_months", "mandatory"],
+    "VaccineSchedule": ["schedule_id", "vaccine_name", "dose_number", "recommended_age_months", "mandatory", "description", "benefits"],
     "Summaries": ["call_id", "child_id", "summary", "startedAt", "endedAt"],
     "ChildUsers": ["child_id", "username", "password_hash", "created_at", "updated_at"],
-    "HealthcareProviders": ["provider_id", "provider_name", "specialty", "address", "pincode", "phone", "email"]
+    "HealthcareProviders": ["provider_id", "provider_name", "specialty", "address", "pincode", "phone", "email"],
+    "Appointments":["appointment_id", "child_id ", "appointment_date", "provider_id", "schedule_id"]
 }
 
 all_tables = set(schema.keys())
@@ -777,6 +790,10 @@ class ChatMessage(BaseModel):
 
 class QueryRequest(BaseModel):
     messages: List[ChatMessage]
+class VaccineDetailResponse(BaseModel):
+    vaccine_name: str
+    description: Optional[str] = None
+    benefits: Optional[str] = None
 
 @app.post("/chat-assistant")
 async def chat_assistant(request: QueryRequest):
@@ -917,3 +934,53 @@ async def disease_outbreak(current_user=Depends(get_current_user)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+
+@app.get("/vaccine-details", response_model=VaccineDetailResponse)
+async def get_vaccine_details(vaccine_name: str = Query(..., description="Name of the vaccine")):
+    query = """
+    SELECT vaccine_name, description, benefits
+    FROM VaccineSchedule
+    WHERE vaccine_name = :vaccine_name
+    LIMIT 1
+    """
+    row = await database.fetch_one(query=query, values={"vaccine_name": vaccine_name})
+    if not row:
+        raise HTTPException(status_code=404, detail="Vaccine not found")
+
+    return VaccineDetailResponse(
+        vaccine_name=row["vaccine_name"],
+        description=row["description"],
+        benefits=row["benefits"],
+    )
+
+class AppointmentCreate(BaseModel):
+    child_id: int
+    appointment_date: str  # ISO format date string
+    provider_id: int
+    schedule_id: int
+
+
+@app.post("/appointments", status_code=201)
+async def create_appointment(
+    appointment: AppointmentCreate,
+    current_user=Depends(get_current_user)
+):
+    # You may validate child_id matches current_user.child_id here
+
+    insert_query = """
+    INSERT INTO Appointments (child_id, appointment_date, provider_id, schedule_id)
+    VALUES (:child_id, :appointment_date, :provider_id, :schedule_id)
+    """
+    await database.execute(query=insert_query, values=appointment.dict())
+    return {"message": "Appointment scheduled successfully"}
+
+
+@app.get("/appointments-for-child")
+async def get_appointments_for_child(current_user=Depends(get_current_user)):
+    query = """
+    SELECT schedule_id FROM Appointments
+    WHERE child_id = :child_id
+    """
+    rows = await database.fetch_all(query, values={"child_id": current_user["child_id"]})
+    return [row["schedule_id"] for row in rows]
