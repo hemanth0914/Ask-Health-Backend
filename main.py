@@ -7,6 +7,7 @@ from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, date
 from typing import List, Optional, Dict, Literal
+
 import re
 import smtplib
 from email.message import EmailMessage
@@ -39,17 +40,17 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 # Load environment variables
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-print(f"Environment loaded, API key {'is set' if OPENAI_API_KEY else 'is NOT set'}")
 
 if not OPENAI_API_KEY:
     raise ValueError("OPENAI_API_KEY environment variable is not set. Please check your .env file.")
 
-# Initialize OpenAI client
-openai_client = OpenAI(
-    api_key=OPENAI_API_KEY
-)
-
-print("OpenAI client initialized with API key")
+try:
+    # Initialize OpenAI client
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    print("OpenAI client initialized successfully")
+except Exception as e:
+    print(f"Error initializing OpenAI client: {str(e)}")
+    raise
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -195,14 +196,13 @@ class ChildCreate(BaseModel):
 class Summary(BaseModel):
     call_id: str
     summary: str
-    startedAt: str
+    startedAt: str  # ISO format
     endedAt: Optional[str] = None
     recordingUrl: Optional[str] = None
     stereoRecordingUrl: Optional[str] = None
     transcript: Optional[str] = None
     status: Optional[str] = None
     endedReason: Optional[str] = None
-    symptomsAnalysis: Optional[dict] = None
 
 class Token(BaseModel):
     access_token: str
@@ -327,37 +327,119 @@ def vaccine_name_not_empty(cls, v):
 # Helper functions for disease matching
 def calculate_match_score(symptoms: List[Dict], disease_pattern: Dict) -> float:
     try:
-        primary_symptoms = set(json.loads(disease_pattern["primary_symptoms"]))
-        secondary_symptoms = set(json.loads(disease_pattern["secondary_symptoms"]))
-        weights = json.loads(disease_pattern["severity_weights"])
+        # Debug print to see the actual data
+        print(f"Disease pattern received: {disease_pattern}")
+        print(f"Symptoms received: {symptoms}")
+
+        # Ensure disease_pattern is a dictionary
+        if not isinstance(disease_pattern, dict):
+            print(f"Invalid disease_pattern type: {type(disease_pattern)}")
+            return 0.0
+
+        # Get the disease name for better error messages
+        disease_name = disease_pattern.get('name', 'Unknown Disease')
+            
+        # Parse comma-separated symptoms into sets
+        primary_symptoms = set(s.strip().lower() for s in disease_pattern.get('primary_symptoms', '').split(',') if s.strip())
+        secondary_symptoms = set(s.strip().lower() for s in disease_pattern.get('secondary_symptoms', '').split(',') if s.strip())
         
-        symptom_names = set(s["symptom_name"].lower() for s in symptoms)
+        # Fixed weights
+        weights = {
+            "primary": 1.0,
+            "secondary": 0.5
+        }
         
+        # Safely extract symptom names
+        symptom_names = set()
+        for symptom in symptoms:
+            if isinstance(symptom, dict):
+                name = symptom.get('symptom_name', '')
+                if name:
+                    symptom_names.add(name.lower())
+            else:
+                print(f"Invalid symptom format: {symptom}")
+        
+        # Debug print symptom sets
+        print(f"Processed primary symptoms for {disease_name}: {primary_symptoms}")
+        print(f"Processed secondary symptoms for {disease_name}: {secondary_symptoms}")
+        print(f"Processed patient symptoms: {symptom_names}")
+        
+        if not primary_symptoms and not secondary_symptoms:
+            print(f"No symptoms defined for disease: {disease_name}")
+            return 0.0
+            
+        # Calculate matches
         primary_matches = len(primary_symptoms.intersection(symptom_names))
         secondary_matches = len(secondary_symptoms.intersection(symptom_names))
         
+        # Calculate weighted scores
+        primary_weight_sum = len(primary_symptoms) * weights["primary"]
+        secondary_weight_sum = len(secondary_symptoms) * weights["secondary"]
+        total_weight_sum = primary_weight_sum + secondary_weight_sum
+        
+        if total_weight_sum == 0:
+            print(f"Total weight sum is 0 for disease: {disease_name}")
+            return 0.0
+            
+        # Calculate final score
         total_score = (
             (primary_matches * weights["primary"]) + 
             (secondary_matches * weights["secondary"])
-        ) / (
-            (len(primary_symptoms) * weights["primary"]) + 
-            (len(secondary_symptoms) * weights["secondary"])
-        )
+        ) / total_weight_sum
+        
+        print(f"Score calculation for {disease_name}:")
+        print(f"Primary matches: {primary_matches}/{len(primary_symptoms)}")
+        print(f"Secondary matches: {secondary_matches}/{len(secondary_symptoms)}")
+        print(f"Final score: {total_score}")
         
         return total_score
+        
     except Exception as e:
         print(f"Error calculating match score: {str(e)}")
+        print(f"Disease pattern: {disease_pattern}")
+        print(f"Symptoms: {symptoms}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return 0.0
 
 def get_matching_symptoms(symptoms: List[Dict], pattern: Dict) -> List[Dict]:
     try:
-        pattern_symptoms = set(
-            json.loads(pattern["primary_symptoms"]) + 
-            json.loads(pattern["secondary_symptoms"])
-        )
-        return [s for s in symptoms if s["symptom_name"].lower() in pattern_symptoms]
+        # Debug print
+        print(f"Processing pattern: {pattern}")
+        print(f"Processing symptoms: {symptoms}")
+        
+        # Parse comma-separated symptoms into sets
+        primary_symptoms = set(s.strip().lower() for s in pattern.get('primary_symptoms', '').split(',') if s.strip())
+        secondary_symptoms = set(s.strip().lower() for s in pattern.get('secondary_symptoms', '').split(',') if s.strip())
+        
+        pattern_symptoms = primary_symptoms.union(secondary_symptoms)
+        print(f"Combined pattern symptoms: {pattern_symptoms}")
+        
+        # Only return symptoms that match and have all required fields
+        matching_symptoms = []
+        for symptom in symptoms:
+            if not isinstance(symptom, dict):
+                print(f"Invalid symptom format: {symptom}")
+                continue
+                
+            symptom_name = symptom.get('symptom_name', '').lower()
+            if symptom_name and symptom_name in pattern_symptoms:
+                matching_symptoms.append({
+                    "name": symptom_name,
+                    "severity": symptom.get('severity', 'Not specified'),
+                    "duration": symptom.get('duration', 'Not specified'),
+                    "context": symptom.get('context', '')
+                })
+        
+        print(f"Found matching symptoms: {matching_symptoms}")
+        return matching_symptoms
+        
     except Exception as e:
         print(f"Error getting matching symptoms: {str(e)}")
+        print(f"Pattern: {pattern}")
+        print(f"Symptoms: {symptoms}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         return []
 
 def generate_recommendation(disease: str, confidence: float) -> str:
@@ -547,6 +629,70 @@ async def read_profile(current_user=Depends(get_current_user)):
         "last_name": current_user["last_name"],
     }
 
+class Summary(BaseModel):
+    call_id: str
+    summary: str
+    startedAt: str  # ISO format
+    endedAt: Optional[str] = None
+    recordingUrl: Optional[str] = None
+    stereoRecordingUrl: Optional[str] = None
+    transcript: Optional[str] = None
+    status: Optional[str] = None
+    endedReason: Optional[str] = None
+
+@app.post("/store-summary")
+async def store_summary(
+    summary_data: Summary,
+    current_user=Depends(get_current_user)
+):
+    started_at = parse_iso_datetime(summary_data.startedAt)
+    ended_at = parse_iso_datetime(summary_data.endedAt) if summary_data.endedAt else None
+
+    insert_query = """
+    INSERT INTO Summaries (
+        call_id, 
+        child_id,
+        summary, 
+        startedAt, 
+        endedAt,
+        recordingUrl,
+        stereoRecordingUrl,
+        transcript,
+        status,
+        endedReason
+    ) VALUES (
+        :call_id,
+        :child_id,
+        :summary,
+        :startedAt,
+        :endedAt,
+        :recordingUrl,
+        :stereoRecordingUrl,
+        :transcript,
+        :status,
+        :endedReason
+    )
+    """
+    
+    values = {
+        "call_id": summary_data.call_id,
+        "child_id": current_user["child_id"],
+        "summary": summary_data.summary,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "recordingUrl": summary_data.recordingUrl,
+        "stereoRecordingUrl": summary_data.stereoRecordingUrl,
+        "transcript": summary_data.transcript,
+        "status": summary_data.status,
+        "endedReason": summary_data.endedReason
+    }
+
+    try:
+        await database.execute(query=insert_query, values=values)
+        return {"message": "Summary stored successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/summaries", response_model=List[Summary])
 async def fetch_summaries(current_user=Depends(get_current_user)):
     query = """
@@ -582,59 +728,6 @@ async def fetch_summaries(current_user=Depends(get_current_user)):
         summaries.append(summary)
 
     return summaries
-
-@app.post("/store-summary")
-async def save_summary(call_data: Summary, current_user=Depends(get_current_user)):
-    started_at = parse_iso_datetime(call_data.startedAt) if call_data.startedAt else None
-    ended_at = parse_iso_datetime(call_data.endedAt) if call_data.endedAt else None
-
-    query = """
-    INSERT INTO Summaries (
-        call_id, 
-        child_id,
-        summary, 
-        startedAt, 
-        endedAt,
-        recordingUrl,
-        stereoRecordingUrl,
-        transcript,
-        status,
-        endedReason,
-        symptoms_analysis
-    ) VALUES (
-        :call_id,
-        :child_id,
-        :summary,
-        :startedAt,
-        :endedAt,
-        :recordingUrl,
-        :stereoRecordingUrl,
-        :transcript,
-        :status,
-        :endedReason,
-        :symptoms_analysis
-    )
-    """
-    values = {
-        "call_id": call_data.call_id,
-        "child_id": current_user["child_id"],
-        "summary": call_data.summary,
-        "startedAt": started_at,
-        "endedAt": ended_at,
-        "recordingUrl": call_data.recordingUrl,
-        "stereoRecordingUrl": call_data.stereoRecordingUrl,
-        "transcript": call_data.transcript,
-        "status": call_data.status,
-        "endedReason": call_data.endedReason,
-        "symptoms_analysis": json.dumps(call_data.symptomsAnalysis) if call_data.symptomsAnalysis else None
-    }
-    
-    try:
-        await database.execute(query=query, values=values)
-        return {"message": "Summary saved successfully"}
-    except Exception as e:
-        print(f"Error saving summary: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to save summary: {str(e)}")
 
 @app.get("/upcoming-vaccines", response_model=List[UpcomingVaccine])
 async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
@@ -726,15 +819,26 @@ async def get_nearby_providers(current_user=Depends(get_current_user)):
 @app.get("/immunization-summary")
 async def get_immunization_summary(current_user=Depends(get_current_user)):
     result = await immunization_status_summary_async(current_user["child_id"])
+    
+    # Enhanced response format for the frontend
     return {
         "child_id": current_user["child_id"],
         "first_name": result["first_name"],
         "last_name": result["last_name"],
         "summary": result["summary"],
-        "total_vaccines": result["total_vaccines"],
-        "completed_count": result["completed_count"],
-        "upcoming_count": result["upcoming_count"]
-    }
+        "statistics": {
+            "total_vaccines": result["total_vaccines"],
+            "completed_count": result["completed_count"],
+            "upcoming_count": result["upcoming_count"],
+            "completion_percentage": round((result["completed_count"] / result["total_vaccines"]) * 100 if result["total_vaccines"] > 0 else 0, 1)
+        },
+        "status": {
+            "isUpToDate": result["completed_count"] == result["total_vaccines"],
+            "hasUpcoming": result["upcoming_count"] > 0,
+            "nextDueDate": result.get("next_due_date"),
+            "lastVaccinationDate": result.get("last_vaccination_date")
+        }
+    } 
 
 @app.post("/vaccine-schedule", status_code=201)
 async def add_vaccine_schedule(
@@ -761,23 +865,40 @@ async def add_vaccine_schedule(
 @app.post("/chat-assistant")
 async def chat_assistant(request: QueryRequest, current_user=Depends(get_current_user)):
     try:
-        user_query = f"For child_id {current_user['child_id']}: {request.messages[-1].content}"
-        result = db_chain(user_query)
+        # Get the last message from the user
+        user_query = request.messages[-1].content
         
+        # Add context about the current user
+        contextualized_query = f"For child_id {current_user['child_id']}: {user_query}"
+        
+        result = db_chain(contextualized_query)
+        
+        # Extract components from the result
         sql_query = result["intermediate_steps"][0]
         query_result = result["intermediate_steps"][1]
         final_answer = result["result"]
 
-        return {
+        # Format the response to match frontend expectations
+        response = {
             "response": final_answer,
             "generated_sql": sql_query,
             "query_result": query_result,
             "message_history": request.messages + [{"role": "assistant", "content": final_answer}]
         }
 
+        return response
+
     except Exception as e:
-        print("Chain Error:", str(e))
-        raise HTTPException(status_code=500, detail=f"Error processing request: {str(e)}")
+        error_msg = str(e)
+        if "invalid_api_key" in error_msg.lower():
+            raise HTTPException(
+                status_code=500,
+                detail="Error with API key configuration. Please contact support."
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing request: {error_msg}"
+        ) 
 
 @app.get("/disease-outbreak", response_model=List[dict])
 async def disease_outbreak(current_user=Depends(get_current_user)):
@@ -878,7 +999,7 @@ async def analyze_symptoms(data: SymptomAnalysis, current_user=Depends(get_curre
         
         for symptom in extracted_data['symptoms']:
             query = """
-            INSERT INTO SymptomRecords 
+            INSERT INTO ExtractedSymptoms 
             (child_id, call_id, symptom_name, severity, duration, first_reported, context)
             VALUES (:child_id, :call_id, :symptom_name, :severity, :duration, NOW(), :context)
             """
@@ -900,9 +1021,10 @@ async def analyze_symptoms(data: SymptomAnalysis, current_user=Depends(get_curre
 @app.post("/check-health-alerts")
 async def check_health_alerts(current_user=Depends(get_current_user)):
     try:
+        # Get recent symptoms
         query = """
         SELECT symptom_name, severity, duration, context, first_reported
-        FROM SymptomRecords
+        FROM ExtractedSymptoms
         WHERE child_id = :child_id
         AND first_reported >= DATE_SUB(NOW(), INTERVAL 7 DAY)
         ORDER BY first_reported DESC
@@ -912,21 +1034,48 @@ async def check_health_alerts(current_user=Depends(get_current_user)):
             values={"child_id": current_user["child_id"]}
         )
         
-        patterns_query = "SELECT * FROM DiseasePatterns"
+        # Convert database rows to list of dictionaries
+        symptoms_list = [
+            {
+                "symptom_name": row["symptom_name"],
+                "severity": row["severity"] or "Not specified",
+                "duration": row["duration"] or "Not specified",
+                "context": row["context"] or ""
+            }
+            for row in recent_symptoms
+        ]
+        
+        # Get disease patterns
+        patterns_query = """
+        SELECT name, primary_symptoms, secondary_symptoms
+        FROM Diseases
+        """
         disease_patterns = await database.fetch_all(query=patterns_query)
+        
+        if not disease_patterns:
+            print("No disease patterns found in database")
+            return {"alerts": []}
         
         alerts = []
         for pattern in disease_patterns:
-            match_score = calculate_match_score(recent_symptoms, pattern)
-            if match_score >= pattern["match_threshold"]:
-                matching_symptoms = get_matching_symptoms(recent_symptoms, pattern)
-                alert = {
-                    "disease": pattern["disease_name"],
-                    "confidence": round(match_score * 100, 2),
-                    "matching_symptoms": matching_symptoms,
-                    "recommendation": generate_recommendation(pattern["disease_name"], match_score)
-                }
-                alerts.append(alert)
+            # Convert Record object to dictionary
+            pattern_dict = {
+                "name": pattern["name"],
+                "primary_symptoms": pattern["primary_symptoms"],
+                "secondary_symptoms": pattern["secondary_symptoms"]
+            }
+            
+            match_score = calculate_match_score(symptoms_list, pattern_dict)
+            if match_score >= 0.7:  # Threshold for potential match
+                matching_symptoms = get_matching_symptoms(symptoms_list, pattern_dict)
+                if matching_symptoms:  # Only add alert if there are matching symptoms
+                    alert = {
+                        "disease": pattern_dict["name"],
+                        "confidence": round(match_score * 100, 2),
+                        "matching_symptoms": matching_symptoms,
+                        "recommendation": generate_recommendation(pattern_dict["name"], match_score)
+                    }
+                    alerts.append(alert)
         
         if alerts:
             for alert in alerts:
@@ -964,6 +1113,8 @@ async def check_health_alerts(current_user=Depends(get_current_user)):
         
     except Exception as e:
         print(f"Error in check_health_alerts: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health-alerts")
