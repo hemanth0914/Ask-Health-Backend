@@ -6,7 +6,7 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 from datetime import datetime, timedelta, date
-from typing import List, Optional, Dict, Literal
+from typing import List, Optional, Dict, Literal, Tuple, Any
 
 import re
 import smtplib
@@ -819,6 +819,8 @@ async def get_nearby_providers(current_user=Depends(get_current_user)):
 @app.get("/immunization-summary")
 async def get_immunization_summary(current_user=Depends(get_current_user)):
     result = await immunization_status_summary_async(current_user["child_id"])
+    print(result["completed_count"])
+    print(result["upcoming_count"])
     
     # Enhanced response format for the frontend
     return {
@@ -862,6 +864,90 @@ async def add_vaccine_schedule(
 
     return {"message": "Vaccine schedule added and notifications sent."}
 
+async def generate_sql_response(query: str, schema: Dict) -> Tuple[str, Any, str]:
+    try:
+        # Create schema information for context
+        schema_info = "Available tables and their columns:\n"
+        for table, columns in schema.items():
+            schema_info += f"\n{table}: {', '.join(columns)}"
+        
+        # Generate SQL query using OpenAI
+        sql_messages = [
+            {"role": "system", "content": f"""You are a SQL query generator for a child healthcare system. Generate SQL queries based on natural language questions.
+            {schema_info}
+            
+            Rules:
+            1. ONLY return the SQL query, nothing else
+            2. Use proper table names and columns from the schema
+            3. Join tables when necessary using appropriate keys
+            4. Use appropriate WHERE clauses for filtering
+            5. Handle NULL values appropriately
+            6. Format dates using MySQL date functions when needed
+            7. Ensure child_id is properly filtered when querying personal data"""},
+            {"role": "user", "content": query}
+        ]
+
+        sql_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=sql_messages,
+            temperature=0,
+        )
+        
+        generated_sql = sql_response.choices[0].message.content.strip()
+        
+        # Validate table and column names
+        sql_lower = generated_sql.lower()
+        for table in schema.keys():
+            if table.lower() in sql_lower:
+                # For each referenced table, validate its columns
+                for column in schema[table]:
+                    if column.lower() in sql_lower:
+                        continue
+        
+        # Execute the validated query
+        results = await database.fetch_all(query=generated_sql)
+        
+        # Format results for natural language response
+        results_str = json.dumps([dict(row) for row in results], default=str)
+        
+        # Generate natural language response with full context
+        response_messages = [
+            {"role": "system", "content": """You are a helpful pediatric healthcare assistant that explains medical data in natural language.
+            Format the response in a clear, friendly way that parents can understand.
+            If there are multiple results, summarize them appropriately.
+            If there are no results, explain that clearly.
+            Always maintain a caring and supportive tone.
+            
+            When responding:
+            1. Consider both the original question and the SQL results
+            2. Explain the findings in a way that directly answers the original question
+            3. Provide relevant context and explanations for medical terms
+            4. If appropriate, suggest follow-up actions or recommendations
+            5. Keep the tone professional but friendly"""},
+            {"role": "user", "content": f"""Original Question: {query}
+            
+SQL Query Used: {generated_sql}
+
+Query Results: {results_str}
+
+Please provide a comprehensive response that answers the original question using this data."""}
+        ]
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=response_messages,
+            temperature=0.7,
+        )
+        
+        return generated_sql, results, response.choices[0].message.content.strip()
+        
+    except Exception as e:
+        print(f"Error in generate_sql_response: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing query: {str(e)}"
+        )
+
 @app.post("/chat-assistant")
 async def chat_assistant(request: QueryRequest, current_user=Depends(get_current_user)):
     try:
@@ -871,13 +957,9 @@ async def chat_assistant(request: QueryRequest, current_user=Depends(get_current
         # Add context about the current user
         contextualized_query = f"For child_id {current_user['child_id']}: {user_query}"
         
-        result = db_chain(contextualized_query)
+        # Generate SQL, execute it, and get natural language response
+        sql_query, query_result, final_answer = await generate_sql_response(contextualized_query, schema)
         
-        # Extract components from the result
-        sql_query = result["intermediate_steps"][0]
-        query_result = result["intermediate_steps"][1]
-        final_answer = result["result"]
-
         # Format the response to match frontend expectations
         response = {
             "response": final_answer,
@@ -898,7 +980,7 @@ async def chat_assistant(request: QueryRequest, current_user=Depends(get_current
         raise HTTPException(
             status_code=500,
             detail=f"Error processing request: {error_msg}"
-        ) 
+        )
 
 @app.get("/disease-outbreak", response_model=List[dict])
 async def disease_outbreak(current_user=Depends(get_current_user)):
