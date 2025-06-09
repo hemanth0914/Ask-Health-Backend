@@ -1,14 +1,21 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, status, Query, BackgroundTasks, WebSocket
 from pydantic import BaseModel, validator
 from databases import Database
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from jose import JWTError, jwt
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 from typing import List, Optional, Dict, Literal, Tuple, Any
-
+from passlib.context import CryptContext
+from fastapi import HTTPException, status, Depends
+from fastapi.security import OAuth2PasswordRequestForm
+from datetime import datetime, timedelta
 import re
+from fastapi.responses import StreamingResponse
+import io
+import openai
+import json
 import smtplib
 from email.message import EmailMessage
 import pandas as pd
@@ -17,11 +24,16 @@ import json
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
-from langchain_community.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain_experimental.sql import SQLDatabaseChain
 from langchain_community.utilities import SQLDatabase
 from langchain.prompts.prompt import PromptTemplate
 from sqlalchemy import create_engine, text
+import base64
+import tempfile
+from app.database import SessionLocal, engine, Base
+import traceback
+from gtts import gTTS
 
 # Database configuration
 DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/childhealth"
@@ -34,7 +46,14 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 # Initialize database
 database = Database(DATABASE_URL)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__default_rounds=12,
+    bcrypt__min_rounds=12
+)
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # Load environment variables
@@ -67,6 +86,9 @@ app.add_middleware(
 # Initialize SQLAlchemy engine
 engine = create_engine(SYNC_DATABASE_URL)
 db = SQLDatabase(engine)
+
+# Initialize healthcare agent
+healthcare_agent = None  # Will be initialized during startup
 
 # Initialize ChatOpenAI with deterministic settings
 llm = ChatOpenAI(
@@ -130,9 +152,9 @@ PROMPT = PromptTemplate(
 )
 
 # Initialize SQLDatabaseChain with stricter settings
-db_chain = SQLDatabaseChain(
+db_chain = SQLDatabaseChain.from_llm(
     llm=llm,
-    database=db,
+    db=db,
     prompt=PROMPT,
     verbose=True,
     return_intermediate_steps=True,
@@ -150,8 +172,8 @@ EMAIL_FROM = "indalavenkatasrisaihemanth@gmail.com"
 # Schema definition
 schema = {
     "Children": ["child_id", "first_name", "last_name", "date_of_birth", "gender", "blood_type", "pincode", "email"],
-    "VaccinationTakenRecords": ["record_id", "child_id", "vaccine_name", "dose_number", "date_administered", "administered_by", "reminder_sent", "notes"],
-    "VaccineSchedule": ["schedule_id", "vaccine_name", "dose_number", "recommended_age_months", "mandatory", "description", "benefits"],
+    "Appointments": ["appointment_id", "child_id", "provider_id", "provider_name", "appointment_date", "notes", "status", "created_at"],
+    "HealthAlerts": ["alert_id", "child_id", "disease", "confidence", "matching_symptoms", "reported_at"],
     "HealthcareProviders": ["provider_id", "provider_name", "specialty", "address", "pincode", "phone", "email"],
 }
 
@@ -167,6 +189,31 @@ class Provider(BaseModel):
     pincode: Optional[str]
     phone: Optional[str]
     email: Optional[str]
+
+class SymptomDetail(BaseModel):
+    name: str
+    severity: Optional[str] = None
+    duration: Optional[str] = None
+    context: Optional[str] = None
+
+class SymptomAnalysisRequest(BaseModel):
+    callId: str
+    symptoms: List[SymptomDetail]
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "callId": "call_123",
+                "symptoms": [
+                    {
+                        "name": "fever",
+                        "severity": "high",
+                        "duration": "2 days",
+                        "context": "started after exposure to rain"
+                    }
+                ]
+            }
+        }
 
 class VaccineScheduleCreate(BaseModel):
     vaccine_name: str
@@ -187,11 +234,71 @@ class ChildCreate(BaseModel):
     last_name: str
     date_of_birth: str  # YYYY-MM-DD
     gender: str
-    parent_id: int
     blood_type: str
     pincode: str
+    email: str
     username: str
     password: str
+
+    @validator('username')
+    def username_must_be_valid(cls, v):
+        if not v:
+            raise ValueError('Username cannot be empty')
+        if not re.match("^[a-zA-Z0-9_]{4,20}$", v):
+            raise ValueError('Username must be 4-20 characters long and contain only letters, numbers, and underscores')
+        return v
+
+    @validator('password')
+    def password_must_be_strong(cls, v):
+        if not v:
+            raise ValueError('Password cannot be empty')
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        if not re.search("[A-Z]", v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search("[a-z]", v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search("[0-9]", v):
+            raise ValueError('Password must contain at least one number')
+        return v
+
+    @validator('email')
+    def email_must_be_valid(cls, v):
+        if not v:
+            raise ValueError('Email cannot be empty')
+        if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", v):
+            raise ValueError('Invalid email format')
+        return v
+
+    @validator('date_of_birth')
+    def validate_date_of_birth(cls, v):
+        try:
+            datetime.strptime(v, '%Y-%m-%d')
+            return v
+        except ValueError:
+            raise ValueError('Invalid date format. Use YYYY-MM-DD')
+
+    @validator('gender')
+    def validate_gender(cls, v):
+        valid_genders = ['male', 'female', 'other']
+        if v.lower() not in valid_genders:
+            raise ValueError('Gender must be one of: male, female, other')
+        return v.lower()
+
+    @validator('blood_type')
+    def validate_blood_type(cls, v):
+        valid_blood_types = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+        if v not in valid_blood_types:
+            raise ValueError('Invalid blood type. Must be one of: ' + ', '.join(valid_blood_types))
+        return v
+
+    @validator('pincode')
+    def validate_pincode(cls, v):
+        if not v:
+            raise ValueError('Pincode cannot be empty')
+        if not re.match(r'^\d{6}$', v):
+            raise ValueError('Pincode must be 6 digits')
+        return v
 
 class Summary(BaseModel):
     call_id: str
@@ -207,11 +314,6 @@ class Summary(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
-
-class SymptomAnalysis(BaseModel):
-    transcript: str
-    userId: str
-    callId: str
 
 class Symptom(BaseModel):
     name: str
@@ -230,7 +332,7 @@ class ChatMessage(BaseModel):
     content: str
 
 class QueryRequest(BaseModel):
-    messages: List[ChatMessage]
+    query: str
 
 class VaccineDetailResponse(BaseModel):
     vaccine_name: str
@@ -253,11 +355,121 @@ class UpcomingVaccine(BaseModel):
     due_date: str
     appointment_booked: bool
 
-# Utility Functions
-def verify_password(plain_password, hashed_password):
+# Provider Models
+class ProviderProfile(BaseModel):
+    provider_id: int
+    provider_name: str
+    specialty: Optional[str]
+    address: Optional[str]
+    pincode: Optional[str]
+    phone: Optional[str]
+    email: Optional[str]
+
+class AssignedPatient(BaseModel):
+    child_id: int
+    first_name: str
+    last_name: str
+    date_of_birth: date
+    last_visit: Optional[datetime]
+    has_alerts: bool
+
+class PatientAlert(BaseModel):
+    patient_name: str
+    disease_name: str
+    confidence_score: float
+    matching_symptoms: List[Dict]
+    created_at: datetime
+
+# Add this with other Pydantic models
+class ProviderSignup(BaseModel):
+    username: str
+    password: str
+    provider_name: str
+    specialty: Optional[str] = None
+    address: Optional[str] = None
+    pincode: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "username": "dr_smith",
+                "password": "SecurePass123",
+                "provider_name": "Dr. John Smith",
+                "specialty": "Pediatrician",
+                "address": "123 Medical Center, Austin",
+                "pincode": "78701",
+                "phone": "512-555-0123",
+                "email": "dr.smith@example.com"
+            }
+        }
+    
+    @validator('username')
+    def username_must_be_valid(cls, v):
+        if not v:
+            raise ValueError('Username cannot be empty')
+        if not re.match("^[a-zA-Z0-9_]{4,20}$", v):
+            raise ValueError('Username must be 4-20 characters long and contain only letters, numbers, and underscores')
+        return v
+    
+    @validator('password')
+    def password_must_be_strong(cls, v):
+        if not v:
+            raise ValueError('Password cannot be empty')
+        if len(v) < 8:
+            raise ValueError('Password must be at least 8 characters long')
+        if not re.search("[A-Z]", v):
+            raise ValueError('Password must contain at least one uppercase letter')
+        if not re.search("[a-z]", v):
+            raise ValueError('Password must contain at least one lowercase letter')
+        if not re.search("[0-9]", v):
+            raise ValueError('Password must contain at least one number')
+        return v
+    
+    @validator('provider_name')
+    def provider_name_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Provider name cannot be empty')
+        if len(v) > 255:
+            raise ValueError('Provider name must be less than 255 characters')
+        return v.strip()
+    
+    @validator('specialty')
+    def specialty_length(cls, v):
+        if v and len(v) > 100:
+            raise ValueError('Specialty must be less than 100 characters')
+        return v if v else None
+    
+    @validator('email')
+    def email_must_be_valid(cls, v):
+        if v:
+            if len(v) > 255:
+                raise ValueError('Email must be less than 255 characters')
+            if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", v):
+                raise ValueError('Invalid email format. Please use a valid email address (e.g., doctor@hospital.com)')
+        return v if v else None
+    
+    @validator('phone')
+    def phone_must_be_valid(cls, v):
+        if v:
+            if len(v) > 20:
+                raise ValueError('Phone number must be less than 20 characters')
+            if not re.match(r"^[0-9+\-() ]{5,20}$", v):
+                raise ValueError('Invalid phone number format. Examples: 512-555-0123, +1-512-555-0123')
+        return v if v else None
+    
+    @validator('pincode')
+    def pincode_length(cls, v):
+        if v and len(v) > 10:
+            raise ValueError('Pincode must be less than 10 characters')
+        return v if v else None
+
+# Authentication functions
+def verify_password(plain_password: str, hashed_password: str) -> bool:
     return pwd_context.verify(plain_password, hashed_password)
 
-def get_password_hash(password):
+def get_password_hash(password: str) -> str:
     return pwd_context.hash(password)
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None):
@@ -266,6 +478,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# Child/User authentication
 async def get_child_user_by_username(username: str):
     query = "SELECT cu.child_id, cu.username, cu.password_hash, c.first_name, c.last_name FROM ChildUsers cu JOIN Children c ON cu.child_id = c.child_id WHERE cu.username = :username"
     return await database.fetch_one(query=query, values={"username": username})
@@ -295,6 +508,46 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
     if user is None:
         raise credentials_exception
     return user
+
+# Provider authentication
+async def get_provider_by_username(username: str):
+    query = """
+    SELECT pu.provider_user_id, pu.username, pu.password_hash, 
+           hp.provider_id, hp.provider_name, hp.specialty, hp.address, hp.pincode, hp.phone, hp.email
+    FROM HealthcareProviderUsers pu
+    JOIN HealthcareProviders hp ON pu.provider_id = hp.provider_id
+    WHERE pu.username = :username
+    """
+    return await database.fetch_one(query=query, values={"username": username})
+
+async def authenticate_provider(username: str, password: str):
+    provider = await get_provider_by_username(username)
+    if not provider:
+        return False
+    if not verify_password(password, provider["password_hash"]):
+        return False
+    return provider
+
+async def get_current_provider(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    provider = await get_provider_by_username(username)
+    if provider is None:
+        raise credentials_exception
+    return provider
+
+# Utility Functions
 
 def months_between(start_date, end_date):
     rd = relativedelta(end_date, start_date)
@@ -469,6 +722,7 @@ async def immunization_status_summary_async(child_id: int, upcoming_window=2):
     gender = child["gender"]
 
     today = pd.to_datetime(datetime.today().date())
+    print(f"Today: {today}")
     age_months = months_between(dob, today)
 
     # Fetch all vaccine schedule and taken records in one query for better performance
@@ -580,24 +834,69 @@ async def immunization_status_summary_async(child_id: int, upcoming_window=2):
 # API Routes
 @app.on_event("startup")
 async def startup():
-    await database.connect()
+    try:
+        # First connect to the database
+        await database.connect()
+        print("Database connected successfully")
+        
+        # Create database tables
+        Base.metadata.create_all(bind=engine)
+        print("Database tables created successfully")
+
+        # Initialize healthcare agent
+        global healthcare_agent
+        healthcare_agent = {
+            "process_query": process_agent_query,
+            "process_provider_query": process_agent_query,
+            "clear_conversation": lambda: None  # No-op since we don't maintain conversation state
+        }
+        print("Healthcare agent initialized successfully")
+        
+    except Exception as e:
+        print(f"Error during startup: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise
 
 @app.on_event("shutdown")
 async def shutdown():
-    await database.disconnect()
+    try:
+        # Close database connection
+        await database.disconnect()
+        print("Database disconnected successfully")
+    except Exception as e:
+        print(f"Error during shutdown: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise
 
 @app.post("/signup", status_code=201)
 async def signup(child: ChildCreate):
-    insert_child_query = """
-    INSERT INTO Children (first_name, last_name, date_of_birth, gender, parent_id, blood_type, pincode)
-    VALUES (:first_name, :last_name, :date_of_birth, :gender, :parent_id, :blood_type, :pincode)
+    # First create parent record
+    insert_parent_query = """
+    INSERT INTO Parents (email)
+    VALUES (:email)
     """
-    child_values = child.dict()
-    child_values.pop("username")
-    child_values.pop("password")
-
+    
     async with database.transaction():
+        # Create parent first
+        parent_id = await database.execute(
+            query=insert_parent_query,
+            values={"email": child.email}  # Using the email for parent record
+        )
+        
+        # Now create child record with the new parent_id
+        insert_child_query = """
+        INSERT INTO Children (first_name, last_name, date_of_birth, gender, parent_id, blood_type, pincode, email)
+        VALUES (:first_name, :last_name, :date_of_birth, :gender, :parent_id, :blood_type, :pincode, :email)
+        """
+        
+        child_values = child.dict()
+        child_values.pop("username")
+        child_values.pop("password")
+        child_values["parent_id"] = parent_id  # Use the newly created parent_id
+
         child_id = await database.execute(query=insert_child_query, values=child_values)
+        
+        # Create user credentials
         hashed_pw = get_password_hash(child.password)
         insert_user_query = """
         INSERT INTO ChildUsers (child_id, username, password_hash)
@@ -609,7 +908,7 @@ async def signup(child: ChildCreate):
             "password_hash": hashed_pw
         })
 
-    return {"message": "Child user created successfully", "child_id": child_id}
+    return {"message": "Child user created successfully", "child_id": child_id, "parent_id": parent_id}
 
 @app.post("/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -628,17 +927,6 @@ async def read_profile(current_user=Depends(get_current_user)):
         "first_name": current_user["first_name"],
         "last_name": current_user["last_name"],
     }
-
-class Summary(BaseModel):
-    call_id: str
-    summary: str
-    startedAt: str  # ISO format
-    endedAt: Optional[str] = None
-    recordingUrl: Optional[str] = None
-    stereoRecordingUrl: Optional[str] = None
-    transcript: Optional[str] = None
-    status: Optional[str] = None
-    endedReason: Optional[str] = None
 
 @app.post("/store-summary")
 async def store_summary(
@@ -707,7 +995,10 @@ async def fetch_summaries(current_user=Depends(get_current_user)):
         status,
         endedReason
     FROM Summaries
-    WHERE child_id = :child_id AND summary != 'No summary available.'
+    WHERE child_id = :child_id 
+    AND summary IS NOT NULL 
+    AND summary != '' 
+    AND summary != 'No summary available.'
     ORDER BY startedAt DESC
     """
     results = await database.fetch_all(query=query, values={"child_id": current_user["child_id"]})
@@ -741,17 +1032,25 @@ async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
     last_name = child["last_name"]
 
     today = datetime.utcnow().date()
-    age_in_months = months_between(dob.date(), today)
-    upcoming_age_start = age_in_months
-    upcoming_age_end = age_in_months + 1
+    thirty_days_later = today + timedelta(days=30)
+    
+    # Calculate the age range in months for the next 30 days
+    current_age_months = months_between(dob.date(), today)
+    age_in_30_days = months_between(dob.date(), thirty_days_later)
 
     query_schedule = """
     SELECT schedule_id, vaccine_name, dose_number, recommended_age_months, mandatory
     FROM VaccineSchedule
-    WHERE recommended_age_months BETWEEN :start_age AND :end_age
+    WHERE recommended_age_months BETWEEN :current_age AND :future_age
     ORDER BY recommended_age_months
     """
-    schedules = await database.fetch_all(query=query_schedule, values={"start_age": upcoming_age_start, "end_age": upcoming_age_end})
+    schedules = await database.fetch_all(
+        query=query_schedule, 
+        values={
+            "current_age": current_age_months,
+            "future_age": age_in_30_days
+        }
+    )
 
     query_taken = """
     SELECT vaccine_name, dose_number FROM VaccinationTakenRecords WHERE child_id = :child_id
@@ -760,7 +1059,7 @@ async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
     taken_set = {(r["vaccine_name"], r["dose_number"]) for r in taken_records}
 
     query_appointments = """
-    SELECT schedule_id FROM Appointments WHERE child_id = :child_id
+    SELECT schedule_id FROM Appointments WHERE child_id = :child_id AND status = 'scheduled'
     """
     appointment_rows = await database.fetch_all(query=query_appointments, values={"child_id": current_user["child_id"]})
     appointment_ids = {r["schedule_id"] for r in appointment_rows}
@@ -770,16 +1069,18 @@ async def get_upcoming_vaccines(current_user=Depends(get_current_user)):
         if (s["vaccine_name"], s["dose_number"]) in taken_set:
             continue
         due_date = (dob + relativedelta(months=+s["recommended_age_months"])).date().isoformat()
-        result.append({
-            "child_id": current_user["child_id"],
-            "schedule_id": s["schedule_id"],
-            "first_name": first_name,
-            "last_name": last_name,
-            "vaccine_name": s["vaccine_name"],
-            "dose_number": s["dose_number"],
-            "due_date": due_date,
-            "appointment_booked": s["schedule_id"] in appointment_ids
-        })
+        # Only include if due date is within the next 30 days
+        if today <= datetime.strptime(due_date, '%Y-%m-%d').date() <= thirty_days_later:
+            result.append({
+                "child_id": current_user["child_id"],
+                "schedule_id": s["schedule_id"],
+                "first_name": first_name,
+                "last_name": last_name,
+                "vaccine_name": s["vaccine_name"],
+                "dose_number": s["dose_number"],
+                "due_date": due_date,
+                "appointment_booked": s["schedule_id"] in appointment_ids
+            })
 
     return result
 
@@ -952,7 +1253,7 @@ Please provide a comprehensive response that answers the original question using
 async def chat_assistant(request: QueryRequest, current_user=Depends(get_current_user)):
     try:
         # Get the last message from the user
-        user_query = request.messages[-1].content
+        user_query = request.query
         
         # Add context about the current user
         contextualized_query = f"For child_id {current_user['child_id']}: {user_query}"
@@ -965,7 +1266,7 @@ async def chat_assistant(request: QueryRequest, current_user=Depends(get_current
             "response": final_answer,
             "generated_sql": sql_query,
             "query_result": query_result,
-            "message_history": request.messages + [{"role": "assistant", "content": final_answer}]
+            "message_history": [{"role": "user", "content": user_query}, {"role": "assistant", "content": final_answer}]
         }
 
         return response
@@ -982,8 +1283,8 @@ async def chat_assistant(request: QueryRequest, current_user=Depends(get_current
             detail=f"Error processing request: {error_msg}"
         )
 
-@app.get("/disease-outbreak", response_model=List[dict])
-async def disease_outbreak(current_user=Depends(get_current_user)):
+@app.get("/provider/disease-outbreak", response_model=List[dict])
+async def disease_outbreak(current_provider=Depends(get_current_provider)):
     today = datetime.utcnow().date()
     thirty_days_ago = today - timedelta(days=30)
 
@@ -1022,6 +1323,75 @@ async def get_vaccine_details(vaccine_name: str = Query(..., description="Name o
         benefits=row["benefits"],
     )
 
+async def send_appointment_confirmation_emails(child_id: int, provider_id: int, appointment_date: str, schedule_id: int):
+    # Get child details
+    child_query = """
+    SELECT c.first_name, c.last_name, c.email
+    FROM Children c
+    WHERE c.child_id = :child_id
+    """
+    child = await database.fetch_one(child_query, values={"child_id": child_id})
+    
+    # Get provider details
+    provider_query = """
+    SELECT provider_name, email
+    FROM HealthcareProviders
+    WHERE provider_id = :provider_id
+    """
+    provider = await database.fetch_one(provider_query, values={"provider_id": provider_id})
+    
+    # Get vaccine details
+    vaccine_query = """
+    SELECT vaccine_name, dose_number
+    FROM VaccineSchedule
+    WHERE schedule_id = :schedule_id
+    """
+    vaccine = await database.fetch_one(vaccine_query, values={"schedule_id": schedule_id})
+    
+    if child and provider and vaccine:
+        # Format date for email
+        appointment_datetime = datetime.strptime(appointment_date, "%Y-%m-%d")
+        formatted_date = appointment_datetime.strftime("%B %d, %Y")
+        
+        # Email to child/parent
+        child_subject = f"Appointment Confirmation - {vaccine['vaccine_name']} Vaccination"
+        child_body = f"""
+Dear {child['first_name']} {child['last_name']},
+
+Your appointment has been scheduled for {vaccine['vaccine_name']} (Dose {vaccine['dose_number']}).
+
+Details:
+- Date: {formatted_date}
+- Healthcare Provider: {provider['provider_name']}
+
+Please arrive 10 minutes before your scheduled time.
+
+Best regards,
+AskHealth Team
+        """
+        
+        # Email to provider
+        provider_subject = f"New Appointment Scheduled - {vaccine['vaccine_name']}"
+        provider_body = f"""
+Dear {provider['provider_name']},
+
+A new vaccination appointment has been scheduled.
+
+Details:
+- Patient: {child['first_name']} {child['last_name']}
+- Vaccine: {vaccine['vaccine_name']} (Dose {vaccine['dose_number']})
+- Date: {formatted_date}
+
+Best regards,
+AskHealth Team
+        """
+        
+        # Send emails
+        if child['email']:
+            send_email(child_subject, child_body, [child['email']])
+        if provider['email']:
+            send_email(provider_subject, provider_body, [provider['email']])
+
 @app.post("/appointments", status_code=201)
 async def create_appointment(
     appointment: AppointmentCreate,
@@ -1031,67 +1401,44 @@ async def create_appointment(
     INSERT INTO Appointments (child_id, appointment_date, provider_id, schedule_id)
     VALUES (:child_id, :appointment_date, :provider_id, :schedule_id)
     """
-    await database.execute(query=insert_query, values=appointment.dict())
+    
+    async with database.transaction():
+        await database.execute(query=insert_query, values=appointment.dict())
+        # Send confirmation emails
+        await send_appointment_confirmation_emails(
+            appointment.child_id,
+            appointment.provider_id,
+            appointment.appointment_date,
+            appointment.schedule_id
+        )
+    
     return {"message": "Appointment scheduled successfully"}
 
-@app.get("/appointments-for-child")
-async def get_appointments_for_child(current_user=Depends(get_current_user)):
-    query = """
-    SELECT schedule_id FROM Appointments
-    WHERE child_id = :child_id
-    """
-    rows = await database.fetch_all(query, values={"child_id": current_user["child_id"]})
-    return [row["schedule_id"] for row in rows]
+def calculate_age(birth_date):
+    today = datetime.now().date()
+    age = relativedelta(today, birth_date)
+    if age.years > 0:
+        return f"{age.years} years"
+    elif age.months > 0:
+        return f"{age.months} months"
+    else:
+        return f"{age.days} days"
 
 @app.post("/analyze-symptoms")
-async def analyze_symptoms(data: SymptomAnalysis, current_user=Depends(get_current_user)):
+async def analyze_symptoms(data: SymptomAnalysisRequest):
     try:
-        messages = [
-            {"role": "system", "content": """
-            You are a medical symptoms analyzer. Extract medical symptoms from the conversation. 
-            For each symptom include:
-            - Exact symptom name (be specific and consistent)
-            - Severity (mild/moderate/severe if mentioned)
-            - Duration (how long they've had it)
-            - Context (relevant details about when it occurs, what makes it better/worse)
-            
-            Return ONLY valid JSON in this format:
-            {
-                "symptoms": [
-                    {
-                        "name": "symptom name",
-                        "severity": "mild/moderate/severe",
-                        "duration": "duration mentioned",
-                        "context": "relevant context"
-                    }
-                ]
-            }
-            """},
-            {"role": "user", "content": data.transcript}
-        ]
+        # Extract symptoms from the conversation
+        extracted_data = {
+            "symptoms": []
+        }
         
-        response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=messages,
-            temperature=0.3,
-            response_format={ "type": "json_object" }
-        )
-        
-        extracted_data = json.loads(response.choices[0].message.content)
-        
-        for symptom in extracted_data['symptoms']:
-            query = """
-            INSERT INTO ExtractedSymptoms 
-            (child_id, call_id, symptom_name, severity, duration, first_reported, context)
-            VALUES (:child_id, :call_id, :symptom_name, :severity, :duration, NOW(), :context)
-            """
-            await database.execute(query=query, values={
-                "child_id": current_user["child_id"],
+        for symptom in data.symptoms:
+            extracted_data["symptoms"].append({
                 "call_id": data.callId,
-                "symptom_name": symptom["name"].lower(),
-                "severity": symptom.get("severity"),
-                "duration": symptom.get("duration"),
-                "context": symptom.get("context")
+                "symptom_name": symptom.name.lower(),
+                "severity": symptom.severity,
+                "duration": symptom.duration,
+                "context": symptom.context
             })
             
         return {"status": "success", "symptoms": extracted_data["symptoms"]}
@@ -1202,10 +1549,25 @@ async def check_health_alerts(current_user=Depends(get_current_user)):
 @app.get("/health-alerts")
 async def get_health_alerts(current_user=Depends(get_current_user)):
     query = """
-    SELECT disease_name, confidence_score, matching_symptoms, created_at
-    FROM HealthAlerts
-    WHERE child_id = :child_id
-    ORDER BY created_at DESC
+    SELECT 
+        ha.alert_id,
+        ha.disease_name,
+        ha.confidence_score,
+        ha.matching_symptoms,
+        ha.created_at,
+        CASE 
+            WHEN a.appointment_id IS NOT NULL THEN 'booked'
+            ELSE 'pending'
+        END as booking_status,
+        CONVERT_TZ(a.appointment_date, '+00:00', @@session.time_zone) as appointment_date,
+        hp.provider_name,
+        hp.address,
+        hp.phone
+    FROM HealthAlerts ha
+    LEFT JOIN Appointments a ON ha.alert_id = a.healthalert_id AND a.status = 'scheduled'
+    LEFT JOIN HealthcareProviders hp ON a.provider_id = hp.provider_id
+    WHERE ha.child_id = :child_id
+    ORDER BY ha.created_at DESC
     LIMIT 10
     """
     alerts = await database.fetch_all(
@@ -1216,10 +1578,18 @@ async def get_health_alerts(current_user=Depends(get_current_user)):
     return {
         "alerts": [
             {
+                "id": alert["alert_id"],
                 "disease": alert["disease_name"],
                 "confidence": alert["confidence_score"],
                 "matching_symptoms": json.loads(alert["matching_symptoms"]),
-                "created_at": alert["created_at"].isoformat()
+                "created_at": alert["created_at"].isoformat(),
+                "booking_status": alert["booking_status"],
+                "appointment": {
+                    "date": alert["appointment_date"].isoformat() if alert["appointment_date"] else None,
+                    "provider_name": alert["provider_name"],
+                    "address": alert["address"],
+                    "phone": alert["phone"]
+                } if alert["booking_status"] == "booked" else None
             }
             for alert in alerts
         ]
@@ -1246,3 +1616,1268 @@ async def notify_all_children_new_vaccine(vaccine_name: str, dose_number: int, r
     if emails:
         # For large numbers of emails, consider batching or async email sending
         send_email(subject, body, emails)
+
+# Provider routes
+@app.post("/provider/login", response_model=Token)
+async def provider_login(form_data: OAuth2PasswordRequestForm = Depends()):
+    try:
+        print(f"\n=== Provider Login Debug ===")
+        print(f"Login attempt for username: {form_data.username}")
+        
+        # Get provider details
+        provider = await get_provider_by_username(form_data.username)
+        
+        if not provider:
+            print("No provider found with this username")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        print(f"Found provider: {provider['username']}")
+        print(f"Stored hash: {provider['password_hash']}")
+        
+        # Verify password
+        is_password_correct = verify_password(form_data.password, provider['password_hash'])
+        print(f"Password verification result: {is_password_correct}")
+        
+        if not is_password_correct:
+            print("Password verification failed")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect username or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            
+        print(f"Authentication successful for provider: {provider['username']}")
+        
+        # Generate token with provider-specific claims
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={
+                "sub": provider["username"],
+                "type": "provider",
+                "provider_id": provider["provider_id"]
+            },
+            expires_delta=access_token_expires
+        )
+        
+        print("Login successful - token generated")
+        print("=== Debug End ===\n")
+        
+        return {"access_token": access_token, "token_type": "bearer"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error in provider_login: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred"
+        )
+
+@app.get("/provider/profile", response_model=ProviderProfile)
+async def read_provider_profile(current_provider=Depends(get_current_provider)):
+    return {
+        "provider_id": current_provider["provider_id"],
+        "provider_name": current_provider["provider_name"],
+        "specialty": current_provider["specialty"],
+        "address": current_provider["address"],
+        "pincode": current_provider["pincode"],
+        "phone": current_provider["phone"],
+        "email": current_provider["email"]
+    }
+
+@app.post("/provider/signup", status_code=201, response_model=dict)
+async def provider_signup(provider: ProviderSignup):
+    """
+    Register a new healthcare provider.
+    """
+    try:
+        # Debug logging
+        print("\n=== Provider Signup Debug ===")
+        print(f"Received request data: {provider.dict()}")
+        
+        # Check if username already exists
+        check_query = "SELECT 1 FROM HealthcareProviderUsers WHERE username = :username"
+        existing_user = await database.fetch_one(check_query, values={"username": provider.username})
+        if existing_user:
+            print(f"Username {provider.username} already exists")
+            raise HTTPException(
+                status_code=400,
+                detail="Username already registered"
+            )
+            
+        # Check if email already exists (only if email is provided)
+        if provider.email:
+            check_email_query = "SELECT 1 FROM HealthcareProviders WHERE email = :email"
+            existing_email = await database.fetch_one(check_email_query, values={"email": provider.email})
+            if existing_email:
+                print(f"Email {provider.email} already exists")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Email already registered"
+                )
+            
+        async with database.transaction():
+            # First, insert into HealthcareProviders
+            provider_query = """
+            INSERT INTO HealthcareProviders 
+            (provider_name, specialty, address, pincode, phone, email)
+            VALUES (:provider_name, :specialty, :address, :pincode, :phone, :email)
+            """
+            provider_values = {
+                "provider_name": provider.provider_name,
+                "specialty": provider.specialty,
+                "address": provider.address,
+                "pincode": provider.pincode,
+                "phone": provider.phone,
+                "email": provider.email
+            }
+            print(f"Inserting provider with values: {provider_values}")
+            provider_id = await database.execute(provider_query, values=provider_values)
+            print(f"Created provider with ID: {provider_id}")
+            
+            # Then, insert into HealthcareProviderUsers
+            user_query = """
+            INSERT INTO HealthcareProviderUsers 
+            (provider_id, username, password_hash)
+            VALUES (:provider_id, :username, :password_hash)
+            """
+            user_values = {
+                "provider_id": provider_id,
+                "username": provider.username,
+                "password_hash": get_password_hash(provider.password)
+            }
+            print(f"Inserting provider user with values: {user_values}")
+            await database.execute(user_query, values=user_values)
+            
+        # Generate token for immediate login
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={
+                "sub": provider.username,
+                "type": "provider",
+                "provider_id": provider_id
+            },
+            expires_delta=access_token_expires
+        )
+        
+        print("Provider signup successful")
+        print("=== Debug End ===\n")
+        
+        return {
+            "message": "Provider registered successfully",
+            "provider_id": provider_id,
+            "access_token": access_token,
+            "token_type": "bearer"
+        }
+        
+    except ValidationError as e:
+        print(f"Validation error: {str(e)}")
+        raise HTTPException(
+            status_code=422,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error in provider_signup: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail="An error occurred while registering the provider"
+        )
+
+@app.post("/provider/store-summary")
+async def store_provider_summary(
+    summary_data: Summary,
+    current_provider=Depends(get_current_provider)
+):
+    started_at = parse_iso_datetime(summary_data.startedAt)
+    ended_at = parse_iso_datetime(summary_data.endedAt) if summary_data.endedAt else None
+
+    insert_query = """
+    INSERT INTO ProviderSummaries (
+        call_id, 
+        provider_id,
+        summary, 
+        startedAt, 
+        endedAt,
+        recordingUrl,
+        stereoRecordingUrl,
+        transcript,
+        status,
+        endedReason
+    ) VALUES (
+        :call_id,
+        :provider_id,
+        :summary,
+        :startedAt,
+        :endedAt,
+        :recordingUrl,
+        :stereoRecordingUrl,
+        :transcript,
+        :status,
+        :endedReason
+    )
+    """
+    
+    values = {
+        "call_id": summary_data.call_id,
+        "provider_id": current_provider["provider_id"],
+        "summary": summary_data.summary,
+        "startedAt": started_at,
+        "endedAt": ended_at,
+        "recordingUrl": summary_data.recordingUrl,
+        "stereoRecordingUrl": summary_data.stereoRecordingUrl,
+        "transcript": summary_data.transcript,
+        "status": summary_data.status,
+        "endedReason": summary_data.endedReason
+    }
+
+    try:
+        await database.execute(query=insert_query, values=values)
+        return {"message": "Summary stored successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/provider/summaries", response_model=List[Summary])
+async def fetch_provider_summaries(current_provider=Depends(get_current_provider)):
+    query = """
+    SELECT 
+        call_id, 
+        summary, 
+        startedAt, 
+        endedAt,
+        recordingUrl,
+        stereoRecordingUrl,
+        transcript,
+        status,
+        endedReason
+    FROM ProviderSummaries
+    WHERE provider_id = :provider_id 
+    AND summary IS NOT NULL 
+    AND summary != '' 
+    AND summary != 'No summary available.'
+    ORDER BY startedAt DESC
+    """
+    results = await database.fetch_all(query=query, values={"provider_id": current_provider["provider_id"]})
+    
+    summaries = []
+    for row in results:
+        summary = {
+            "call_id": row["call_id"],
+            "summary": row["summary"],
+            "startedAt": row["startedAt"].isoformat() if row["startedAt"] else None,
+            "endedAt": row["endedAt"].isoformat() if row["endedAt"] else None,
+            "recordingUrl": row["recordingUrl"],
+            "stereoRecordingUrl": row["stereoRecordingUrl"],
+            "transcript": row["transcript"],
+            "status": row["status"],
+            "endedReason": row["endedReason"]
+        }
+        summaries.append(summary)
+
+    return summaries
+
+@app.get("/provider/local-health-alerts")
+async def get_provider_local_health_alerts(current_provider=Depends(get_current_provider)):
+    try:
+        # Get provider's pincode
+        provider_query = """
+        SELECT pincode FROM HealthcareProviders WHERE provider_id = :provider_id
+        """
+        provider_data = await database.fetch_one(
+            query=provider_query,
+            values={"provider_id": current_provider["provider_id"]}
+        )
+
+        if not provider_data:
+            raise HTTPException(status_code=404, detail="Provider not found")
+
+        # Get alerts from the same pincode area that haven't been confirmed yet
+        query = """
+        SELECT 
+            ha.alert_id,
+            ha.disease_name as disease,
+            CONCAT(c.first_name, ' ', c.last_name) as patient_name,
+            c.child_id,
+            c.email as patient_email,
+            ha.confidence_score,
+            ha.matching_symptoms,
+            ha.created_at
+        FROM HealthAlerts ha
+        JOIN Children c ON ha.child_id = c.child_id
+        LEFT JOIN diseasesDiagnosedChildren ddc ON ha.alert_id = ddc.alert_id
+        WHERE c.pincode = :pincode
+        AND ddc.alert_id IS NULL  # Only get unconfirmed alerts
+        ORDER BY ha.created_at DESC
+        """
+
+        alerts = await database.fetch_all(
+            query=query,
+            values={"pincode": provider_data["pincode"]}
+        )
+
+        return {
+            "alerts": [
+                {
+                    "alert_id": alert["alert_id"],
+                    "disease": alert["disease"],
+                    "patient_name": alert["patient_name"],
+                    "child_id": alert["child_id"],
+                    "patient_email": alert["patient_email"],
+                    "matching_symptoms": json.loads(alert["matching_symptoms"]) if alert["matching_symptoms"] else [],
+                    "reported_at": alert["created_at"].isoformat() if alert["created_at"] else None
+                }
+                for alert in alerts
+            ]
+        }
+    except Exception as e:
+        print(f"Error fetching local health alerts: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching local health alerts: {str(e)}"
+        )
+
+class AgentQueryRequest(BaseModel):
+    query: str
+    return_audio: bool = True  # Whether to return audio response
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "Show me my appointments for today",
+                "return_audio": True
+            }
+        }
+
+@app.post("/agent/query/provider")
+async def agent_query_provider(
+    request: AgentQueryRequest,
+    current_provider=Depends(get_current_provider)
+):
+    """Process a query specifically for healthcare providers"""
+    try:
+        print("\n=== Processing Provider Query ===")
+        print(f"Input query: {request.query}")
+        
+        # Validate query
+        if not request.query or len(request.query.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        
+        # Process the query using the new approach
+        response = await process_agent_query(
+            query=request.query,
+            current_provider=current_provider
+        )
+        
+        # Create the base response
+        result = {
+            "text_response": response["message"],
+            "success": True,
+            "audio_response": None,
+            "query_understood": request.query,
+            "data": response.get("data")
+        }
+        
+        # Only attempt TTS if requested and we have a text response
+        if request.return_audio and result["text_response"]:
+            try:
+                audio_response = openai_client.audio.speech.create(
+                    model="tts-1",
+                    voice="nova",
+                    input=result["text_response"]
+                )
+                result["audio_response"] = base64.b64encode(audio_response.content).decode()
+                print("TTS conversion successful")
+            except Exception as e:
+                print(f"\n=== TTS Error ===")
+                print(f"Error details: {str(e)}")
+                result["tts_error"] = str(e)
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\n=== Endpoint Error ===")
+        print(f"Error processing provider query: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing query: {str(e)}"
+        )
+
+@app.post("/agent/query/user")
+async def agent_query_user(
+    request: AgentQueryRequest,
+    current_user=Depends(get_current_user)
+):
+    """Process a query through the healthcare agent for users/patients"""
+    try:
+        if not request.query or len(request.query.strip()) == 0:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+            
+        response = await process_agent_query(
+            query=request.query,
+            current_user=current_user
+        )
+        
+        result = {
+            "text_response": response["message"],
+            "success": True,
+            "audio_response": None,
+            "query_understood": request.query,
+            "data": response.get("data")
+        }
+        
+        if request.return_audio and result["text_response"]:
+            try:
+                audio_response = openai_client.audio.speech.create(
+                    model="tts-1",
+                    voice="nova",
+                    input=result["text_response"]
+                )
+                result["audio_response"] = base64.b64encode(audio_response.content).decode()
+            except Exception as e:
+                result["tts_error"] = str(e)
+        
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/agent/clear")
+async def clear_agent_conversation(current_user=Depends(get_current_user)):
+    """
+    Clear the agent's conversation history
+    """
+    try:
+        if not healthcare_agent:
+            raise HTTPException(status_code=500, detail="Agent not initialized")
+            
+        healthcare_agent["clear_conversation"]()
+        return {"message": "Conversation history cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class TTSRequest(BaseModel):
+    text: str
+    voice: str = "en-US-JennyNeural"  # Default voice
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "Hello, how can I help you today?",
+                "voice": "en-US-JennyNeural"  # Azure Neural voice
+            }
+        }
+
+@app.post("/tts")
+async def text_to_speech(request: TTSRequest):
+    """Convert text to speech using OpenAI's TTS API"""
+    try:
+        if not request.text:
+            raise HTTPException(
+                status_code=400,
+                detail="Text content is required"
+            )
+
+        try:
+            # Generate speech using OpenAI's TTS API
+            audio_response = openai_client.audio.speech.create(
+                model="tts-1",
+                voice="nova",  # Professional female voice
+                input=request.text
+            )
+            
+            # Create a byte stream from the response
+            audio_stream = io.BytesIO(audio_response.content)
+            audio_stream.seek(0)
+            
+            return StreamingResponse(
+                audio_stream,
+                media_type="audio/mpeg",
+                headers={
+                    "Accept-Ranges": "bytes",
+                    "Content-Disposition": "attachment;filename=speech.mp3"
+                }
+            )
+            
+        except Exception as e:
+            print(f"TTS error: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error generating speech: {str(e)}"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Unexpected error in text_to_speech: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="An unexpected error occurred while processing the request"
+        )
+
+@app.post("/agent/query")
+async def process_agent_query(
+    query: str = Query(..., description="The query to process"),
+    current_provider=None,
+    current_user=None
+):
+    """Process a query through the healthcare agent"""
+    try:
+        # Check query type based on keywords
+        appointment_keywords = ["appointment", "appointments", "schedule", "scheduled", "visit", "visits", "meeting", "consultation"]
+        today_keywords = ["today", "today's", "todays", "current day"]
+        vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization", "shot", "shots", "dose", "doses"]
+        health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease", "warning", "notifications"]
+
+        is_appointment_query = any(keyword in query.lower() for keyword in appointment_keywords)
+        is_today_query = any(keyword in query.lower() for keyword in today_keywords)
+        is_vaccination_query = any(keyword in query.lower() for keyword in vaccination_keywords)
+        is_health_alert_query = any(keyword in query.lower() for keyword in health_alert_keywords)
+
+        response_data = {}
+        response_text = []
+
+        # Handle today's appointments specifically
+        if is_today_query and current_provider:
+            today = datetime.utcnow().date()
+            query = """
+            SELECT 
+                DATE_FORMAT(a.appointment_date, '%Y-%m-%dT%H:%i:%s.%fZ') as appointment_date,
+                c.first_name,
+                c.last_name,
+                COALESCE(vs.vaccine_name, 'General Checkup') as vaccine_name,
+                COALESCE(vs.dose_number, 0) as dose_number,
+                a.notes,
+                a.is_general_appointment
+            FROM Appointments a
+            JOIN Children c ON a.child_id = c.child_id
+            LEFT JOIN VaccineSchedule vs ON a.schedule_id = vs.schedule_id
+            WHERE a.provider_id = :provider_id
+            AND DATE(a.appointment_date) = :appointment_date
+            AND a.status = 'scheduled'
+            ORDER BY a.appointment_date ASC
+            """
+            
+            today_appointments = await database.fetch_all(
+                query=query,
+                values={
+                    "provider_id": current_provider["provider_id"],
+                    "appointment_date": today.strftime('%Y-%m-%d')
+                }
+            )
+
+            if today_appointments:
+                response_text.append("\n📅 Today's Appointments:")
+                for appt in today_appointments:
+                    appt_time = datetime.strptime(appt["appointment_date"].split('T')[1][:5], '%H:%M').strftime('%I:%M %p')
+                    appointment_type = "General Checkup" if appt["is_general_appointment"] else f"{appt['vaccine_name']} (Dose {appt['dose_number']})"
+                    response_text.append(f"• {appt_time} - {appt['first_name']} {appt['last_name']}: {appointment_type}")
+                    if appt["notes"]:
+                        response_text.append(f"  Notes: {appt['notes']}")
+            else:
+                response_text.append("\nNo appointments scheduled for today.")
+            
+            response_data["today_appointments"] = [
+                {
+                    "time": datetime.strptime(appt["appointment_date"].split('T')[1][:5], '%H:%M').strftime('%I:%M %p'),
+                    "patient_name": f"{appt['first_name']} {appt['last_name']}",
+                    "appointment_type": "General Checkup" if appt["is_general_appointment"] else appt["vaccine_name"],
+                    "dose_number": appt["dose_number"] if not appt["is_general_appointment"] else None,
+                    "notes": appt["notes"],
+                    "full_date": appt["appointment_date"]
+                }
+                for appt in today_appointments
+            ]
+
+        # Handle regular appointments
+        if is_appointment_query and not is_today_query:
+            time_range = "week"
+            time_range_text = "upcoming week"
+            
+            if any(word in query.lower() for word in ["month", "monthly", "30 days"]):
+                time_range = "month"
+                time_range_text = "next 30 days"
+            elif any(word in query.lower() for word in ["two months", "2 months", "60 days"]):
+                time_range = "two_months"
+                time_range_text = "next 60 days"
+
+            if current_provider:
+                appointments = await get_provider_appointments(
+                    time_range=time_range,
+                    current_provider=current_provider
+                )
+                
+                if not appointments:
+                    response_text.append(f"You don't have any appointments scheduled for the {time_range_text}.")
+                else:
+                    response_text.append(f"Here are your scheduled appointments for the {time_range_text}:")
+                    
+                    appointments_by_date = {}
+                    for appt in appointments:
+                        date_str = appt["appointment_date"].split('T')[0] if isinstance(appt["appointment_date"], str) else appt["appointment_date"].strftime("%Y-%m-%d")
+                        date = datetime.strptime(date_str, "%Y-%m-%d")
+                        if date not in appointments_by_date:
+                            appointments_by_date[date] = []
+                        appointments_by_date[date].append(appt)
+                    
+                    for date, daily_appointments in sorted(appointments_by_date.items()):
+                        response_text.append(f"\n📅 {date.strftime('%A, %B %d, %Y')}:")
+                        for appt in daily_appointments:
+                            response_text.append(f"• Patient: {appt['patient_name']} - {appt['vaccine_name']} (Dose {appt['dose_number']})")
+                
+                response_data["appointments"] = appointments
+
+        # Handle overdue vaccinations
+        if is_vaccination_query and current_provider:
+            overdue_vaccinations = await get_overdue_vaccinations(current_provider)
+            if overdue_vaccinations:
+                response_text.append("\n🚨 Overdue Vaccinations in Your Area:")
+                for vacc in overdue_vaccinations[:5]:  # Show top 5 most overdue
+                    response_text.append(f"• {vacc['child_name']}: {vacc['vaccine_name']} (Dose {vacc['dose_number']}) - {vacc['days_overdue']} days overdue")
+                if len(overdue_vaccinations) > 5:
+                    response_text.append(f"... and {len(overdue_vaccinations) - 5} more overdue vaccinations.")
+            else:
+                response_text.append("\nNo overdue vaccinations in your area.")
+            response_data["overdue_vaccinations"] = overdue_vaccinations
+
+        # Handle health alerts
+        if is_health_alert_query and current_provider:
+            health_alerts = await get_provider_local_health_alerts(current_provider)
+            alerts = health_alerts.get("alerts", [])
+            if alerts:
+                response_text.append("\n🏥 Recent Health Alerts in Your Area:")
+                for alert in alerts[:5]:  # Show top 5 most recent alerts
+                    response_text.append(f"• {alert['disease']} - {alert['confidence']}% confidence - {alert['total_cases_in_area']} cases")
+                if len(alerts) > 5:
+                    response_text.append(f"... and {len(alerts) - 5} more alerts.")
+            else:
+                response_text.append("\nNo recent health alerts in your area.")
+            response_data["health_alerts"] = alerts
+
+        # If no specific query type matched
+        if not any([is_appointment_query, is_vaccination_query, is_health_alert_query, is_today_query]):
+            return {
+                "message": "I can help you with:\n\n• Today's appointments\n• Upcoming appointments and schedules\n• Overdue vaccinations in your area\n• Local health alerts\n\nPlease specify what you'd like to know about.",
+                "type": "help",
+                "data": None
+            }
+
+        return {
+            "message": "\n".join(response_text),
+            "type": "combined",
+            "data": response_data
+        }
+
+    except Exception as e:
+        print(f"Error processing agent query: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing query: {str(e)}"
+        )
+
+class ProviderVoiceQuery(BaseModel):
+    audio_data: Optional[str] = None  # Base64 encoded audio
+    text_query: Optional[str] = None  # Text query if no audio
+    return_audio: bool = False  # Default to false - only generate audio if explicitly requested
+
+@app.post("/provider/voice-assistant")
+async def provider_voice_assistant(
+    query: ProviderVoiceQuery,
+    current_provider=Depends(get_current_provider)
+):
+    """Handle voice/text queries from healthcare providers"""
+    try:
+        # Initialize response variables
+        text_response = ""
+        audio_response = None
+        
+        # Process the input (either audio or text)
+        if query.audio_data:
+            # Convert audio to text using OpenAI Whisper
+            audio_bytes = base64.b64decode(query.audio_data)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_audio:
+                temp_audio.write(audio_bytes)
+                temp_audio.flush()
+                
+                with open(temp_audio.name, "rb") as audio_file:
+                    transcript = openai_client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file
+                    )
+                text_query = transcript.text
+        else:
+            text_query = query.text_query
+            
+        if not text_query:
+            raise HTTPException(status_code=400, detail="No query provided")
+            
+        # Create provider-specific context
+        provider_context = f"""
+        For healthcare provider {current_provider['provider_name']} (ID: {current_provider['provider_id']}).
+        Focus on:
+        - Upcoming appointments
+        - Patient vaccination schedules
+        - Health alerts and notifications
+        """
+        
+        # Process the query
+        messages = [
+            {
+                "role": "system",
+                "content": f"""You are a specialized healthcare assistant for providers.
+                {provider_context}
+                Provide clear, professional responses focused on medical information.
+                Format dates as Month Day, Year.
+                Use bullet points for lists.
+                Keep responses concise but informative."""
+            },
+            {"role": "user", "content": text_query}
+        ]
+        
+        # Generate SQL query
+        sql_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=messages,
+            temperature=0
+        )
+        
+        generated_sql = sql_response.choices[0].message.content.strip()
+        
+        # Execute query and get results
+        results = await database.fetch_all(query=generated_sql)
+        results_str = json.dumps([dict(row) for row in results], default=str)
+        
+        # Generate natural language response
+        response_messages = messages + [
+            {"role": "assistant", "content": generated_sql},
+            {"role": "system", "content": f"Query results: {results_str}. Provide a natural language response."}
+        ]
+        
+        final_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=response_messages,
+            temperature=0.7
+        )
+        
+        text_response = final_response.choices[0].message.content.strip()
+        
+        # Only generate audio if explicitly requested
+        audio_base64 = None
+        if query.return_audio:
+            try:
+                audio_response = openai_client.audio.speech.create(
+                    model="tts-1",
+                    voice="nova",  # Professional female voice
+                    input=text_response
+                )
+                audio_base64 = base64.b64encode(audio_response.content).decode()
+            except Exception as e:
+                print(f"TTS error: {str(e)}")
+                # Continue without audio if TTS fails
+        
+        return {
+            "text_response": text_response,
+            "audio_response": audio_base64,
+            "query_understood": text_query,
+            "success": True
+        }
+        
+    except Exception as e:
+        print(f"Error in provider voice assistant: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing voice query: {str(e)}"
+        )
+
+class VaccineDueResponse(BaseModel):
+    child_name: str
+    child_email: str
+    vaccine_name: str
+    dose_number: int
+    recommended_age_months: int
+    due_date: str
+    days_overdue: int
+    reported_at: str
+
+@app.get("/provider/overdue-vaccinations", response_model=List[VaccineDueResponse])
+async def get_overdue_vaccinations(current_provider=Depends(get_current_provider)):
+    """
+    Get all overdue vaccinations in the provider's area (pincode).
+    A vaccination is considered overdue if the due date is before the current date.
+    Results are ordered by most overdue first.
+    """
+    try:
+        if not current_provider["pincode"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Provider pincode not found. Please update your profile with a valid pincode."
+            )
+
+        query = """
+        SELECT 
+            CONCAT(c.first_name, ' ', c.last_name) AS child_name,
+            c.email as child_email,
+            vs.vaccine_name,
+            vs.dose_number,
+            vs.recommended_age_months,
+            DATE_FORMAT(DATE_ADD(c.date_of_birth, INTERVAL vs.recommended_age_months MONTH), '%Y-%m-%dT%H:%i:%s.%fZ') AS due_date,
+            DATEDIFF(CURDATE(), DATE_ADD(c.date_of_birth, INTERVAL vs.recommended_age_months MONTH)) as days_overdue,
+            DATE_FORMAT(NOW(), '%Y-%m-%dT%H:%i:%s.%fZ') as reported_at
+        FROM Children c
+        CROSS JOIN VaccineSchedule vs
+        LEFT JOIN VaccinationTakenRecords vtr ON (
+            c.child_id = vtr.child_id 
+            AND vs.vaccine_name = vtr.vaccine_name 
+            AND vs.dose_number = vtr.dose_number
+        )
+        WHERE 
+            c.pincode = :pincode
+            AND vtr.record_id IS NULL
+            AND DATE_ADD(c.date_of_birth, INTERVAL vs.recommended_age_months MONTH) < CURDATE()
+        ORDER BY days_overdue DESC
+        """
+
+        results = await database.fetch_all(
+            query=query,
+            values={"pincode": current_provider["pincode"]}
+        )
+
+        return [
+            {
+                "child_name": row["child_name"],
+                "child_email": row["child_email"],
+                "vaccine_name": row["vaccine_name"],
+                "dose_number": row["dose_number"],
+                "recommended_age_months": row["recommended_age_months"],
+                "due_date": row["due_date"],
+                "days_overdue": row["days_overdue"],
+                "reported_at": row["reported_at"]
+            }
+            for row in results
+        ]
+
+    except Exception as e:
+        print(f"Error fetching overdue vaccinations: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error fetching overdue vaccinations: {str(e)}"
+        )
+
+# Update Pydantic models
+class GeneralAppointmentCreate(BaseModel):
+    provider_id: int
+    appointment_date: str  # Should be datetime or use proper date validation
+    notes: Optional[str] = None
+    child_id: Optional[int] = None  # Will be set from authentication
+    healthalert_id: Optional[int] = None  # New field for health alert reference
+    
+    @validator('appointment_date')
+    def validate_appointment_date(cls, v):
+        try:
+            # Parse the date string and validate format
+            parsed_date = datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+            # Ensure appointment is not in the past (with some buffer)
+            if parsed_date.date() < date.today():
+                raise ValueError("Appointment date cannot be in the past")
+            return v
+        except ValueError as e:
+            if "does not match format" in str(e):
+                raise ValueError("Date must be in format YYYY-MM-DD HH:MM:SS")
+            raise e
+
+class AppointmentResponse(BaseModel):
+    appointment_id: int
+    child_id: int
+    provider_id: int
+    provider_name: str
+    appointment_date: datetime
+    notes: Optional[str]
+    status: str = "scheduled"
+    created_at: datetime
+    
+    class Config:
+        from_attributes = True
+        json_encoders = {
+            datetime: lambda dt: dt.isoformat()
+        }
+
+@app.post("/general-appointments", status_code=201, response_model=AppointmentResponse)
+async def create_general_appointment(
+    appointment: GeneralAppointmentCreate,
+    current_user=Depends(get_current_user)
+):
+    try:
+        # Convert appointment time to UTC before storing
+        local_date = datetime.strptime(appointment.appointment_date, "%Y-%m-%d %H:%M:%S")
+        utc_date = local_date.astimezone(timezone.utc)
+        
+        print(f"Converting local time {local_date} to UTC {utc_date}")
+        
+        child_id = current_user["child_id"]
+        
+        # Check if health alert exists and belongs to the user
+        if appointment.healthalert_id:
+            alert_query = """
+            SELECT alert_id FROM HealthAlerts 
+            WHERE alert_id = :alert_id AND child_id = :child_id
+            """
+            alert = await database.fetch_one(
+                query=alert_query,
+                values={"alert_id": appointment.healthalert_id, "child_id": child_id}
+            )
+            if not alert:
+                raise HTTPException(
+                    status_code=404,
+                    detail="Health alert not found or does not belong to the user"
+                )
+        
+        # Rest of the validation code...
+        provider_query = """
+        SELECT provider_id, provider_name, email, phone, address
+        FROM HealthcareProviders
+        WHERE provider_id = :provider_id
+        """
+        provider = await database.fetch_one(
+            query=provider_query,
+            values={"provider_id": appointment.provider_id}
+        )
+        
+        if not provider:
+            raise HTTPException(status_code=404, detail="Healthcare provider not found")
+
+        # Check for conflicts in UTC time
+        conflict_query = """
+        SELECT appointment_id 
+        FROM Appointments 
+        WHERE provider_id = :provider_id 
+        AND appointment_date = :appointment_date
+        AND status != 'cancelled'
+        """
+        existing_appointment = await database.fetch_one(
+            query=conflict_query,
+            values={
+                "provider_id": appointment.provider_id,
+                "appointment_date": utc_date
+            }
+        )
+        
+        if existing_appointment:
+            raise HTTPException(status_code=409, detail="This time slot is already booked")
+
+        async with database.transaction():
+            # Insert the appointment in UTC
+            insert_query = """
+            INSERT INTO Appointments (
+                child_id,
+                provider_id,
+                appointment_date,
+                notes,
+                is_general_appointment,
+                status,
+                created_at,
+                healthalert_id
+            ) VALUES (
+                :child_id,
+                :provider_id,
+                :appointment_date,
+                :notes,
+                TRUE,
+                'scheduled',
+                UTC_TIMESTAMP(),
+                :healthalert_id
+            )
+            """
+            
+            await database.execute(
+                query=insert_query,
+                values={
+                    "child_id": child_id,
+                    "provider_id": appointment.provider_id,
+                    "appointment_date": utc_date,
+                    "notes": appointment.notes,
+                    "healthalert_id": appointment.healthalert_id
+                }
+            )
+
+            # Update health alert status if healthalert_id is provided
+            if appointment.healthalert_id:
+                update_alert_query = """
+                UPDATE HealthAlerts 
+                SET status = 'booked'
+                WHERE alert_id = :alert_id
+                """
+                await database.execute(
+                    query=update_alert_query,
+                    values={"alert_id": appointment.healthalert_id}
+                )
+
+            get_last_id_query = "SELECT LAST_INSERT_ID() as appointment_id"
+            last_id_result = await database.fetch_one(query=get_last_id_query)
+            appointment_id = last_id_result["appointment_id"]
+
+            # Get the appointment details and convert back to local time
+            get_appointment_query = """
+            SELECT 
+                a.appointment_id,
+                a.child_id,
+                a.provider_id,
+                hp.provider_name,
+                CONVERT_TZ(a.appointment_date, '+00:00', @@session.time_zone) as appointment_date,
+                a.notes,
+                a.status,
+                CONVERT_TZ(a.created_at, '+00:00', @@session.time_zone) as created_at,
+                a.healthalert_id
+            FROM Appointments a
+            JOIN HealthcareProviders hp ON a.provider_id = hp.provider_id
+            WHERE a.appointment_id = :appointment_id
+            """
+            
+            result = await database.fetch_one(
+                query=get_appointment_query,
+                values={"appointment_id": appointment_id}
+            )
+
+            if not result:
+                raise HTTPException(status_code=500, detail="Failed to retrieve created appointment")
+
+            appointment_dict = dict(result)
+            return AppointmentResponse(**appointment_dict)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creating appointment: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create appointment: {str(e)}")
+
+@app.get("/provider/appointments")
+async def get_provider_appointments(
+    time_range: Literal["today", "week", "month", "two_months"] = Query(..., description="Time range for appointments"),
+    current_provider=Depends(get_current_provider)
+):
+    try:
+        print(f"\n=== Fetching Provider Appointments ===")
+        print(f"Provider ID: {current_provider['provider_id']}")
+        print(f"Time Range: {time_range}")
+        
+        # Get current time in UTC
+        now_utc = datetime.now(timezone.utc)
+        today_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        
+        if time_range == "today":
+            start_date = today_utc
+            end_date = today_utc + timedelta(days=1)
+        elif time_range == "week":
+            start_date = today_utc
+            end_date = today_utc + timedelta(days=7)
+        elif time_range == "month":
+            start_date = today_utc
+            end_date = today_utc + timedelta(days=30)
+        else:  # two_months
+            start_date = today_utc
+            end_date = today_utc + timedelta(days=60)
+            
+        print(f"UTC time range: {start_date} to {end_date}")
+
+        # Query appointments and convert to local time
+        query = """
+        SELECT DISTINCT
+            CONVERT_TZ(a.appointment_date, '+00:00', @@session.time_zone) as local_appointment_date,
+            a.appointment_date as utc_appointment_date,
+            c.first_name,
+            c.last_name,
+            COALESCE(vs.vaccine_name, 'General Checkup') as vaccine_name,
+            COALESCE(vs.dose_number, 0) as dose_number,
+            a.notes,
+            a.is_general_appointment
+        FROM Appointments a
+        JOIN Children c ON a.child_id = c.child_id
+        LEFT JOIN VaccineSchedule vs ON a.schedule_id = vs.schedule_id
+        WHERE a.provider_id = :provider_id
+            AND a.appointment_date >= :start_date 
+            AND a.appointment_date < :end_date
+            AND a.status = 'scheduled'
+        ORDER BY a.appointment_date ASC
+        """
+
+        appointments = await database.fetch_all(
+            query=query,
+            values={
+                "provider_id": current_provider["provider_id"],
+                "start_date": start_date,
+                "end_date": end_date
+            }
+        )
+        
+        print(f"Found {len(appointments)} appointments")
+
+        formatted_appointments = []
+        for appointment in appointments:
+            local_time = appointment["local_appointment_date"]
+            utc_time = appointment["utc_appointment_date"]
+            
+            print(f"UTC time: {utc_time}, Local time: {local_time}")
+            
+            formatted_appointments.append({
+                "appointment_date": local_time.isoformat(),
+                "utc_appointment_date": utc_time.isoformat(),
+                "patient_name": f"{appointment['first_name']} {appointment['last_name']}".strip(),
+                "vaccine_name": "General Checkup" if appointment["is_general_appointment"] else appointment["vaccine_name"],
+                "dose_number": appointment["dose_number"],
+                "notes": appointment["notes"],
+                "formatted_time": local_time.strftime('%I:%M %p')
+            })
+        
+        return formatted_appointments
+
+    except Exception as e:
+        print(f"Error fetching provider appointments: {str(e)}")
+        print(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Error fetching appointments: {str(e)}")
+
+class ConfirmDiseaseRequest(BaseModel):
+    child_id: int
+    disease: str
+    diagnosed_date: str  # Format: YYYY-MM-DD
+    alert_id: int
+
+    @validator('diagnosed_date')
+    def validate_diagnosed_date(cls, v):
+        try:
+            # Parse the date string and validate format
+            datetime.strptime(v, "%Y-%m-%d")
+            return v
+        except ValueError:
+            raise ValueError("diagnosed_date must be in YYYY-MM-DD format")
+
+    @validator('disease')
+    def validate_disease(cls, v):
+        if not v.strip():
+            raise ValueError("disease cannot be empty")
+        return v.strip()
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "child_id": 1,
+                "disease": "Measles",
+                "diagnosed_date": "2024-03-20",
+                "alert_id": 1
+            }
+        }
+
+@app.post("/provider/confirm-disease")
+async def confirm_disease(
+    request: ConfirmDiseaseRequest,
+    current_provider=Depends(get_current_provider)
+):
+    """Add a confirmed disease diagnosis to the database"""
+    try:
+        # First verify that the alert exists and belongs to the child
+        verify_query = """
+        SELECT alert_id 
+        FROM HealthAlerts 
+        WHERE alert_id = :alert_id AND child_id = :child_id
+        """
+        
+        alert = await database.fetch_one(
+            query=verify_query,
+            values={
+                "alert_id": request.alert_id,
+                "child_id": request.child_id
+            }
+        )
+        
+        if not alert:
+            raise HTTPException(
+                status_code=404,
+                detail="Health alert not found or does not belong to this child"
+            )
+
+        # Insert the confirmed diagnosis
+        query = """
+        INSERT INTO diseasesDiagnosedChildren 
+        (child_id, disease, diagnosed_date, alert_id)
+        VALUES (:child_id, :disease, :diagnosed_date, :alert_id)
+        """
+        
+        await database.execute(
+            query=query,
+            values={
+                "child_id": request.child_id,
+                "disease": request.disease,
+                "diagnosed_date": request.diagnosed_date,
+                "alert_id": request.alert_id
+            }
+        )
+        
+        return {"message": "Disease confirmed successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error confirming disease: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error confirming disease: {str(e)}"
+        )
+
+@app.get("/disease-outbreak", response_model=List[dict])
+async def disease_outbreak(current_user=Depends(get_current_user)):
+    today = datetime.utcnow().date()
+    thirty_days_ago = today - timedelta(days=30)
+
+    query = """
+    SELECT disease, COUNT(*) AS disease_count
+    FROM diseasesDiagnosedChildren
+    WHERE diagnosed_date BETWEEN :thirty_days_ago AND :today
+    GROUP BY disease
+    HAVING disease_count >= 5
+    """
+
+    try:
+        results = await database.fetch_all(query, values={"thirty_days_ago": thirty_days_ago, "today": today})
+        if not results:
+            return []
+        diseases = [{"disease": row["disease"], "count": row["disease_count"]} for row in results]
+        return diseases
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An error occurred: {str(e)}")
+
+class ExecuteQueryRequest(BaseModel):
+    query: str
+
+@app.post("/execute-query")
+async def execute_query(
+    request: ExecuteQueryRequest,
+    current_provider=Depends(get_current_provider)
+):
+    """Execute a read-only SQL query"""
+    try:
+        # Ensure the query is read-only
+        if not request.query.lower().strip().startswith('select'):
+            raise HTTPException(
+                status_code=400,
+                detail="Only SELECT queries are allowed"
+            )
+            
+        # Execute the query
+        result = await database.fetch_all(query=request.query)
+        
+        # Convert result to list of dicts
+        return [dict(row) for row in result]
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error executing query: {str(e)}"
+        )

@@ -1,0 +1,39 @@
+2025-06-06 09:24:39,602 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:24:43,861 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:24:45,649 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:25:03,148 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:25:05,329 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:26:34,920 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:26:36,839 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:26:45,844 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:26:47,757 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:27:06,238 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-06-06 09:27:06,835 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-06-06 09:27:06,950 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:27:07,382 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:27:48,274 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-06-06 09:27:48,577 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:27:48,770 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:28:01,824 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/chat/completions "HTTP/1.1 200 OK"
+2025-06-06 09:28:02,420 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:28:02,597 - httpx - INFO - HTTP Request: POST https://api.openai.com/v1/audio/speech "HTTP/1.1 403 Forbidden"
+2025-06-06 09:29:42,800 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:29:44,924 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:29:48,807 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:30:16,670 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:30:27,191 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:30:29,236 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:31:56,787 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:31:58,889 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:00,532 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:01,149 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:02,753 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:04,081 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:05,612 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:09,970 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:11,742 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:12,157 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:14,075 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:31,570 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:32:33,610 - databases - INFO - Connected to database mysql+aiomysql://root:@localhost:3306/childhealth
+2025-06-06 09:34:22,783 - databases - INFO - Disconnected from database mysql+aiomysql://root:@localhost:3306/childhealth
