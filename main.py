@@ -2141,14 +2141,86 @@ async def process_agent_query(
         today_keywords = ["today", "today's", "todays", "current day"]
         vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization", "shot", "shots", "dose", "doses"]
         health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease", "warning", "notifications"]
+        vaccination_record_keywords = ["has taken", "received", "administered", "given", "took", "got"]
+        child_variations = ["child", "chill", "children", "kid", "patient"]
 
-        is_appointment_query = any(keyword in query.lower() for keyword in appointment_keywords)
-        is_today_query = any(keyword in query.lower() for keyword in today_keywords)
-        is_vaccination_query = any(keyword in query.lower() for keyword in vaccination_keywords)
-        is_health_alert_query = any(keyword in query.lower() for keyword in health_alert_keywords)
+        # Clean up the query
+        cleaned_query = query.lower().strip()
+        
+        # Replace common speech recognition errors
+        for variation in child_variations:
+            if variation in cleaned_query:
+                cleaned_query = cleaned_query.replace(variation, "child")
+                break
+
+        is_appointment_query = any(keyword in cleaned_query for keyword in appointment_keywords)
+        is_today_query = any(keyword in cleaned_query for keyword in today_keywords)
+        is_vaccination_query = any(keyword in cleaned_query for keyword in vaccination_keywords)
+        is_health_alert_query = any(keyword in cleaned_query for keyword in health_alert_keywords)
+        is_vaccination_record = any(keyword in cleaned_query for keyword in vaccination_record_keywords)
 
         response_data = {}
         response_text = []
+
+        # Handle vaccination recording
+        if is_vaccination_record and current_provider:
+            # Multiple patterns to match different ways of saying the same thing
+            vaccination_patterns = [
+                r"(?:child|kid|patient)(?:\s+with)?\s+(?:id\s+)?(\d+)\s+(?:has|have)\s+(?:taken|received|got)\s+([\w\s]+)(?:\s+dose\s+(\d+))?\s+today",
+                r"(?:child|kid|patient)\s+(\d+)\s+(?:has|have)\s+(?:taken|received|got)\s+([\w\s]+)(?:\s+dose\s+(\d+))?\s+today",
+                r"(?:record|log)\s+(?:vaccine|vaccination)\s+(?:for\s+)?(?:child|kid|patient)\s+(\d+)\s+([\w\s]+)(?:\s+dose\s+(\d+))?"
+            ]
+            
+            match = None
+            for pattern in vaccination_patterns:
+                match = re.search(pattern, cleaned_query, re.IGNORECASE)
+                if match:
+                    break
+            
+            if match:
+                child_id = int(match.group(1))
+                vaccine_name = match.group(2).strip()
+                dose_number = int(match.group(3)) if match.group(3) else 1
+                
+                # Verify child exists
+                child_query = "SELECT first_name, last_name FROM Children WHERE child_id = :child_id"
+                child = await database.fetch_one(child_query, values={"child_id": child_id})
+                
+                if child:
+                    response_text.append(f"I heard that child {child_id} ({child['first_name']} {child['last_name']}) has taken {vaccine_name} dose {dose_number} today.")
+                    response_text.append("Please say 'yes' to confirm or 'no' to cancel.")
+                    
+                    response_data["vaccination_record"] = {
+                        "child_id": child_id,
+                        "vaccine_name": vaccine_name,
+                        "dose_number": dose_number,
+                        "child_name": f"{child['first_name']} {child['last_name']}"
+                    }
+                else:
+                    response_text.append(f"I could not find a child with ID {child_id}. Please check the ID and try again.")
+                
+                return {
+                    "message": "\n".join(response_text),
+                    "type": "vaccination_record",
+                    "data": response_data
+                }
+            
+            # Handle confirmation
+            if cleaned_query == "yes" and current_provider:
+                # Record will be handled by frontend
+                response_text.append("Please proceed with recording the vaccination.")
+                return {
+                    "message": "\n".join(response_text),
+                    "type": "confirmation",
+                    "data": response_data
+                }
+            elif query.lower().strip() == "no" and current_provider:
+                response_text.append("Vaccination recording cancelled.")
+                return {
+                    "message": "\n".join(response_text),
+                    "type": "cancellation",
+                    "data": response_data
+                }
 
         # Handle today's appointments specifically
         if is_today_query and current_provider:
@@ -2883,4 +2955,42 @@ async def execute_query(
         raise HTTPException(
             status_code=500,
             detail=f"Error executing query: {str(e)}"
+        )
+
+class VaccinationRecordCreate(BaseModel):
+    child_id: int
+    vaccine_name: str
+    dose_number: int
+    administered_by: str
+    notes: Optional[str] = None
+
+@app.post("/provider/record-vaccination")
+async def record_vaccination(
+    record: VaccinationRecordCreate,
+    current_provider=Depends(get_current_provider)
+):
+    """Record a new vaccination for a child"""
+    try:
+        # Insert the vaccination record
+        query = """
+        INSERT INTO VaccinationTakenRecords 
+        (child_id, vaccine_name, dose_number, date_administered, administered_by, reminder_sent, notes)
+        VALUES (:child_id, :vaccine_name, :dose_number, CURDATE(), :administered_by, 0, :notes)
+        """
+        await database.execute(
+            query=query,
+            values={
+                "child_id": record.child_id,
+                "vaccine_name": record.vaccine_name,
+                "dose_number": record.dose_number,
+                "administered_by": record.administered_by,
+                "notes": record.notes
+            }
+        )
+
+        return {"message": "Vaccination record created successfully"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create vaccination record: {str(e)}"
         )
