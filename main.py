@@ -1448,19 +1448,22 @@ async def analyze_symptoms(data: SymptomAnalysisRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/check-health-alerts")
-async def check_health_alerts(current_user=Depends(get_current_user)):
+async def check_health_alerts(current_user=Depends(get_current_user), call_id: str = None):
     try:
-        # Get recent symptoms
+        # Get symptoms only from the current call
         query = """
         SELECT symptom_name, severity, duration, context, first_reported
         FROM ExtractedSymptoms
         WHERE child_id = :child_id
-        AND first_reported >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+        AND call_id = :call_id
         ORDER BY first_reported DESC
         """
         recent_symptoms = await database.fetch_all(
             query=query, 
-            values={"child_id": current_user["child_id"]}
+            values={
+                "child_id": current_user["child_id"],
+                "call_id": call_id
+            }
         )
         
         # Convert database rows to list of dictionaries
@@ -2672,24 +2675,24 @@ async def get_provider_appointments(
         
         # Get current time in UTC
         now_utc = datetime.now(timezone.utc)
-        today_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
         
+        # For filtering, use current time (not start of day) to exclude past appointments
         if time_range == "today":
-            start_date = today_utc
-            end_date = today_utc + timedelta(days=1)
+            start_date = now_utc  # Use current time, not start of day
+            end_date = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
         elif time_range == "week":
-            start_date = today_utc
-            end_date = today_utc + timedelta(days=7)
+            start_date = now_utc
+            end_date = now_utc + timedelta(days=7)
         elif time_range == "month":
-            start_date = today_utc
-            end_date = today_utc + timedelta(days=30)
+            start_date = now_utc
+            end_date = now_utc + timedelta(days=30)
         else:  # two_months
-            start_date = today_utc
-            end_date = today_utc + timedelta(days=60)
+            start_date = now_utc
+            end_date = now_utc + timedelta(days=60)
             
         print(f"UTC time range: {start_date} to {end_date}")
 
-        # Query appointments and convert to local time
+        # Query appointments - use UTC time for comparison
         query = """
         SELECT DISTINCT
             CONVERT_TZ(a.appointment_date, '+00:00', @@session.time_zone) as local_appointment_date,
@@ -2704,7 +2707,7 @@ async def get_provider_appointments(
         JOIN Children c ON a.child_id = c.child_id
         LEFT JOIN VaccineSchedule vs ON a.schedule_id = vs.schedule_id
         WHERE a.provider_id = :provider_id
-            AND a.appointment_date >= :start_date 
+            AND a.appointment_date >= :start_date  # Compare with UTC start_date (current time)
             AND a.appointment_date < :end_date
             AND a.status = 'scheduled'
         ORDER BY a.appointment_date ASC
