@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Query, BackgroundTasks, WebSocket
+from fastapi import FastAPI, HTTPException, Depends, status, Query, BackgroundTasks, WebSocket, Request
 from pydantic import BaseModel, validator
 from databases import Database
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,10 +34,29 @@ import tempfile
 from app.database import SessionLocal, engine, Base
 import traceback
 from gtts import gTTS
+import bcrypt
+import pytesseract
+from pdf2image import convert_from_path
+import re
+import random
+import string
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from fastapi import UploadFile, File
+import tempfile
+import os
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from email import encoders
+from email.mime.base import MIMEBase
 
 # Database configuration
-DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/childhealth"
-SYNC_DATABASE_URL = "mysql+pymysql://root:@localhost:3306/childhealth"
+DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/ChildHealth"
+SYNC_DATABASE_URL = "mysql+pymysql://root:@localhost:3306/ChildHealth"
 
 # Authentication configuration
 SECRET_KEY = "your-secret-key"
@@ -559,17 +578,69 @@ def parse_iso_datetime(iso_str: str) -> str:
     dt = datetime.fromisoformat(iso_str)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-def send_email(subject: str, body: str, to_emails: List[str]):
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = EMAIL_FROM
-    msg["To"] = ", ".join(to_emails)
-    msg.set_content(body)
+def send_email(subject: str, body: str, to_emails: List[str], attachments: List[Dict] = None):
+    """
+    Send an email with optional attachments using Gmail SMTP
+    
+    Args:
+        subject: Email subject
+        body: Email body
+        to_emails: List of recipient email addresses
+        attachments: List of dictionaries with keys:
+            - filename: Name of the file
+            - content: Binary content of the file
+            - content_type: MIME type of the file
+    """
+    try:
+        # Create message container
+        msg = MIMEMultipart()
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_FROM
+        msg['To'] = ", ".join(to_emails)
 
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.send_message(msg)
+        # Add body
+        msg.attach(MIMEText(body, 'plain'))
+
+        # Add attachments if any
+        if attachments:
+            for attachment in attachments:
+                part = MIMEBase('application', 'octet-stream')
+                part.set_payload(attachment['content'])
+                encoders.encode_base64(part)
+                part.add_header(
+                    'Content-Disposition',
+                    f'attachment; filename="{attachment["filename"]}"'
+                )
+                if 'content_type' in attachment:
+                    part.set_type(attachment['content_type'])
+                msg.attach(part)
+
+        # Send email using Gmail SMTP with proper error handling
+        try:
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+                server.starttls()
+                server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.send_message(msg)
+                print(f"Email sent successfully to {to_emails}")
+        except smtplib.SMTPAuthenticationError:
+            print("SMTP Authentication Error: Invalid credentials")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to authenticate with email server"
+            )
+        except smtplib.SMTPException as smtp_error:
+            print(f"SMTP Error: {str(smtp_error)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"SMTP Error: {str(smtp_error)}"
+            )
+
+    except Exception as e:
+        print(f"Failed to send email: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to send email: {str(e)}"
+        )
 
 @validator("vaccine_name")
 def vaccine_name_not_empty(cls, v):
@@ -2142,6 +2213,7 @@ async def process_agent_query(
         vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization", "shot", "shots", "dose", "doses"]
         health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease", "warning", "notifications"]
         vaccination_record_keywords = ["has taken", "received", "administered", "given", "took", "got"]
+        ehr_keywords = ["ehr", "electronic health record", "health record", "medical record", "patient record", "fetch", "get", "send", "vaccination record"]
         child_variations = ["child", "chill", "children", "kid", "patient"]
 
         # Clean up the query
@@ -2153,72 +2225,202 @@ async def process_agent_query(
                 cleaned_query = cleaned_query.replace(variation, "child")
                 break
 
+        # Extract SSN and vaccine information
+        ssn_pattern = r"ssn\s*(\d{4})"
+        vaccine_pattern = r"vaccination\s*([\w\s-]+?)(?:\s+(?:vaccine|vaccination|shot|dose))?\s*(?:dose\s+(\d+))?\s*today"
+        
+        ssn_match = re.search(ssn_pattern, cleaned_query)
+        vaccine_match = re.search(vaccine_pattern, cleaned_query)
+
+        if ssn_match and vaccine_match:
+            ssn = ssn_match.group(1)
+            vaccine_name = vaccine_match.group(1).strip().upper()
+            dose_number = 1  # Default to dose 1 if not specified
+            
+            # Check if child exists and belongs to the current provider
+            check_child_query = """
+            SELECT child_id, first_name, last_name, provider_id 
+            FROM Children 
+            WHERE ssn = :ssn
+            """
+            existing_child = await database.fetch_one(check_child_query, values={"ssn": int(ssn)})
+            
+            if not existing_child:
+                return {
+                    "status": "error",
+                    "message": f"No child found with SSN {ssn} in the database."
+                }
+            
+            if existing_child["provider_id"] != current_provider["provider_id"]:
+                return {
+                    "status": "error",
+                    "message": "This child is not your client."
+                }
+
+            # Record vaccination
+            insert_query = """
+            INSERT INTO VaccinationTakenRecords (
+                child_id, vaccine_name, dose_number,
+                date_administered, administered_by, notes
+            ) VALUES (
+                :child_id, :vaccine_name, :dose_number,
+                CURDATE(), :administered_by, :notes
+            )
+            """
+            await database.execute(
+                insert_query,
+                values={
+                    "child_id": existing_child["child_id"],
+                    "vaccine_name": vaccine_name,
+                    "dose_number": dose_number,
+                    "administered_by": current_provider["provider_name"],
+                    "notes": f"Recorded via voice assistant by {current_provider['provider_name']}"
+                }
+            )
+
+            return {
+                "status": "success",
+                "message": f"Successfully recorded {vaccine_name} vaccination for {existing_child['first_name']} {existing_child['last_name']}"
+            }
+
+        # Handle other query types...
         is_appointment_query = any(keyword in cleaned_query for keyword in appointment_keywords)
         is_today_query = any(keyword in cleaned_query for keyword in today_keywords)
         is_vaccination_query = any(keyword in cleaned_query for keyword in vaccination_keywords)
         is_health_alert_query = any(keyword in cleaned_query for keyword in health_alert_keywords)
         is_vaccination_record = any(keyword in cleaned_query for keyword in vaccination_record_keywords)
+        is_ehr_request = any(keyword in cleaned_query for keyword in ehr_keywords)
 
         response_data = {}
         response_text = []
 
+        # Handle EHR request
+        if is_ehr_request and current_provider:
+            # Try to extract SSN from the query
+            ssn_pattern = r"ssn\s*(\d{4}|\d{9})"
+            ssn_match = re.search(ssn_pattern, cleaned_query)
+            
+            if ssn_match:
+                ssn = ssn_match.group(1)
+                # Generate and email EHR
+                try:
+                    result = await generate_and_email_ehr(ssn=ssn, current_provider=current_provider)
+                    response_text.append(result["message"])
+                    response_data["ehr_generated"] = True
+                    
+                    return {
+                        "message": "\n".join(response_text),
+                        "type": "ehr_request",
+                        "data": response_data
+                    }
+                except HTTPException as e:
+                    response_text.append(f"Error: {e.detail}")
+                    response_data["ehr_generated"] = False
+                    
+                    return {
+                        "message": "\n".join(response_text),
+                        "type": "ehr_request",
+                        "data": response_data
+                    }
+            else:
+                response_text.append("Please provide the child's SSN (last 4 digits) to fetch their EHR.")
+                response_data["ehr_generated"] = False
+                
+                return {
+                    "message": "\n".join(response_text),
+                    "type": "ehr_request",
+                    "data": response_data
+                }
+
         # Handle vaccination recording
         if is_vaccination_record and current_provider:
-            # Multiple patterns to match different ways of saying the same thing
-            vaccination_patterns = [
-                r"(?:child|kid|patient)(?:\s+with)?\s+(?:id\s+)?(\d+)\s+(?:has|have)\s+(?:taken|received|got)\s+([\w\s]+)(?:\s+dose\s+(\d+))?\s+today",
-                r"(?:child|kid|patient)\s+(\d+)\s+(?:has|have)\s+(?:taken|received|got)\s+([\w\s]+)(?:\s+dose\s+(\d+))?\s+today",
-                r"(?:record|log)\s+(?:vaccine|vaccination)\s+(?:for\s+)?(?:child|kid|patient)\s+(\d+)\s+([\w\s]+)(?:\s+dose\s+(\d+))?"
-            ]
+            # Extract SSN and vaccine details
+            ssn_pattern = r"ssn\s*(\d{4}|\d{9})"
+            vaccine_pattern = r"(?:taken|received|got|has taken)\s+(?:vaccination\s+)?([\w\s-]+?)(?:\s+(?:vaccine|vaccination|shot))?\s*(?:(?:dose\s+(?:(\d+)|one|two|three|four|five|six))?)?\s*(?:today)"
             
-            match = None
-            for pattern in vaccination_patterns:
-                match = re.search(pattern, cleaned_query, re.IGNORECASE)
-                if match:
-                    break
+            print(f"Processing query: {cleaned_query}")  # Debug log
             
-            if match:
-                child_id = int(match.group(1))
-                vaccine_name = match.group(2).strip()
-                dose_number = int(match.group(3)) if match.group(3) else 1
+            ssn_match = re.search(ssn_pattern, cleaned_query)
+            vaccine_match = re.search(vaccine_pattern, cleaned_query, re.IGNORECASE)
+            
+            print(f"SSN match: {ssn_match is not None}")  # Debug log
+            print(f"Vaccine match: {vaccine_match is not None}")  # Debug log
+            
+            if ssn_match and vaccine_match:
+                ssn = ssn_match.group(1)
+                vaccine_name = vaccine_match.group(1).strip().upper()
+                # Remove any extra words that might have been captured
+                vaccine_name = re.sub(r'\b(VACCINATION|VACCINE|SHOT)\b', '', vaccine_name).strip()
                 
-                # Verify child exists
-                child_query = "SELECT first_name, last_name FROM Children WHERE child_id = :child_id"
-                child = await database.fetch_one(child_query, values={"child_id": child_id})
+                # Handle dose number
+                dose_word = vaccine_match.group(2)
+                if dose_word:  # If a dose was specified
+                    if dose_word.isdigit():
+                        dose_number = int(dose_word)
+                    else:
+                        word_to_num = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6}
+                        dose_number = word_to_num.get(dose_word.lower(), 1)
+                else:
+                    dose_number = 1  # Default to dose 1 if not specified
+                
+                print(f"Extracted SSN: {ssn}")  # Debug log
+                print(f"Extracted vaccine: {vaccine_name}")  # Debug log
+                print(f"Extracted dose: {dose_number}")  # Debug log
+                
+                # Verify child exists and belongs to this provider
+                child_query = """
+                SELECT child_id, first_name, last_name 
+                FROM Children 
+                WHERE ssn LIKE :ssn_pattern 
+                AND provider_id = :provider_id
+                """
+                child = await database.fetch_one(
+                    child_query, 
+                    values={
+                        "ssn_pattern": f"%{ssn}" if len(ssn) == 4 else ssn,
+                        "provider_id": current_provider["provider_id"]
+                    }
+                )
                 
                 if child:
-                    response_text.append(f"I heard that child {child_id} ({child['first_name']} {child['last_name']}) has taken {vaccine_name} dose {dose_number} today.")
-                    response_text.append("Please say 'yes' to confirm or 'no' to cancel.")
+                    # Insert vaccination record
+                    insert_query = """
+                    INSERT INTO VaccinationTakenRecords (
+                        child_id, vaccine_name, dose_number, 
+                        date_administered, administered_by, notes
+                    ) VALUES (
+                        :child_id, :vaccine_name, :dose_number,
+                        CURDATE(), :administered_by, :notes
+                    )
+                    """
+                    await database.execute(
+                        insert_query,
+                        values={
+                            "child_id": child["child_id"],
+                            "vaccine_name": vaccine_name,
+                            "dose_number": dose_number,
+                            "administered_by": current_provider["provider_name"],
+                            "notes": f"Recorded via voice assistant by {current_provider['provider_name']}"
+                        }
+                    )
                     
-                    response_data["vaccination_record"] = {
-                        "child_id": child_id,
-                        "vaccine_name": vaccine_name,
-                        "dose_number": dose_number,
-                        "child_name": f"{child['first_name']} {child['last_name']}"
-                    }
+                    response_text.append(f"Successfully recorded that {child['first_name']} {child['last_name']} has received {vaccine_name} dose {dose_number} today.")
+                    response_data["vaccination_recorded"] = True
                 else:
-                    response_text.append(f"I could not find a child with ID {child_id}. Please check the ID and try again.")
+                    response_text.append(f"I could not find a child with SSN ending in {ssn} in your records. You can only record vaccinations for your assigned patients.")
+                    response_data["vaccination_recorded"] = False
                 
                 return {
                     "message": "\n".join(response_text),
                     "type": "vaccination_record",
                     "data": response_data
                 }
-            
-            # Handle confirmation
-            if cleaned_query == "yes" and current_provider:
-                # Record will be handled by frontend
-                response_text.append("Please proceed with recording the vaccination.")
+            else:
+                response_text.append("Please provide both the child's SSN and the vaccine details.")
+                response_data["vaccination_recorded"] = False
                 return {
                     "message": "\n".join(response_text),
-                    "type": "confirmation",
-                    "data": response_data
-                }
-            elif query.lower().strip() == "no" and current_provider:
-                response_text.append("Vaccination recording cancelled.")
-                return {
-                    "message": "\n".join(response_text),
-                    "type": "cancellation",
+                    "type": "vaccination_record",
                     "data": response_data
                 }
 
@@ -2286,31 +2488,19 @@ async def process_agent_query(
                 time_range = "two_months"
                 time_range_text = "next 60 days"
 
-            if current_provider:
-                appointments = await get_provider_appointments(
-                    time_range=time_range,
-                    current_provider=current_provider
-                )
-                
-                if not appointments:
-                    response_text.append(f"You don't have any appointments scheduled for the {time_range_text}.")
-                else:
-                    response_text.append(f"Here are your scheduled appointments for the {time_range_text}:")
-                    
-                    appointments_by_date = {}
-                    for appt in appointments:
-                        date_str = appt["appointment_date"].split('T')[0] if isinstance(appt["appointment_date"], str) else appt["appointment_date"].strftime("%Y-%m-%d")
-                        date = datetime.strptime(date_str, "%Y-%m-%d")
-                        if date not in appointments_by_date:
-                            appointments_by_date[date] = []
-                        appointments_by_date[date].append(appt)
-                    
-                    for date, daily_appointments in sorted(appointments_by_date.items()):
-                        response_text.append(f"\n📅 {date.strftime('%A, %B %d, %Y')}:")
-                        for appt in daily_appointments:
-                            response_text.append(f"• Patient: {appt['patient_name']} - {appt['vaccine_name']} (Dose {appt['dose_number']})")
-                
-                response_data["appointments"] = appointments
+            appointments = await get_provider_appointments(time_range, current_provider)
+            if appointments:
+                response_text.append(f"\n📅 Appointments for the {time_range_text}:")
+                for date, appts in appointments.items():
+                    response_text.append(f"\n{date}:")
+                    for appt in appts:
+                        response_text.append(f"• {appt['time']} - {appt['patient_name']}: {appt['appointment_type']}")
+                        if appt['notes']:
+                            response_text.append(f"  Notes: {appt['notes']}")
+            else:
+                response_text.append(f"\nNo appointments scheduled for the {time_range_text}.")
+            
+            response_data["appointments"] = appointments
 
         # Handle overdue vaccinations
         if is_vaccination_query and current_provider:
@@ -2340,9 +2530,9 @@ async def process_agent_query(
             response_data["health_alerts"] = alerts
 
         # If no specific query type matched
-        if not any([is_appointment_query, is_vaccination_query, is_health_alert_query, is_today_query]):
+        if not any([is_appointment_query, is_vaccination_query, is_health_alert_query, is_today_query, is_ehr_request]):
             return {
-                "message": "I can help you with:\n\n• Today's appointments\n• Upcoming appointments and schedules\n• Overdue vaccinations in your area\n• Local health alerts\n\nPlease specify what you'd like to know about.",
+                "message": "I can help you with:\n\n• Today's appointments\n• Upcoming appointments and schedules\n• Overdue vaccinations in your area\n• Local health alerts\n• Electronic Health Records (EHR)\n• Recording vaccinations\n\nPlease specify what you'd like to know about.",
                 "type": "help",
                 "data": None
             }
@@ -2354,8 +2544,7 @@ async def process_agent_query(
         }
 
     except Exception as e:
-        print(f"Error processing agent query: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
+        print(f"Error processing query: {str(e)}")
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -2993,4 +3182,382 @@ async def record_vaccination(
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create vaccination record: {str(e)}"
+        )
+
+# Add helper functions for PDF processing
+def extract_text_from_pdf(pdf_path):
+    images = convert_from_path(pdf_path)
+    text = ""
+    for image in images:
+        text += pytesseract.image_to_string(image)
+    return text
+
+def convert_date_to_mysql_format(date_str):
+    try:
+        date_obj = datetime.strptime(date_str.strip(), '%B %d, %Y')
+        return date_obj.strftime('%Y-%m-%d')
+    except ValueError as e:
+        print(f"Error parsing date: {e}")
+        raise
+
+def parse_text_to_data(text):
+    data = {}
+    try:
+        data['first_name'] = re.search(r"First Name:\s*(.*)", text).group(1).strip()
+        data['last_name'] = re.search(r"Last Name:\s*(.*)", text).group(1).strip()
+        
+        # Add SSN extraction (4 digits)
+        ssn_match = re.search(r"SSN:\s*(\d{4})", text)
+        if not ssn_match:
+            raise ValueError("SSN not found or invalid format (must be 4 digits)")
+        data['ssn'] = ssn_match.group(1).strip()
+        
+        dob_match = re.search(r"Date of Birth:\s*(.*)", text)
+        if dob_match:
+            date_str = dob_match.group(1).strip()
+            data['dob'] = convert_date_to_mysql_format(date_str)
+        
+        data['gender'] = re.search(r"Gender:\s*(.*)", text).group(1).strip()
+        data['blood_type'] = re.search(r"Blood Type:\s*(.*)", text).group(1).strip()
+        data['pincode'] = re.search(r"Pincode:\s*(.*)", text).group(1).strip()
+        data['email'] = re.search(r"Email:\s*(.*)", text).group(1).strip()
+        data['vaccine_name'] = re.search(r"Vaccine Name:\s*(.*)", text).group(1).strip()
+        data['dose_number'] = int(re.search(r"Dose Number:\s*(\d+)", text).group(1).strip())
+        
+        date_admin_match = re.search(r"Date Administered:\s*(.*)", text)
+        if date_admin_match:
+            date_str = date_admin_match.group(1).strip()
+            data['date_administered'] = convert_date_to_mysql_format(date_str)
+            
+        data['administered_by'] = re.search(r"Administered By:\s*(.*)", text).group(1).strip()
+        data['reminder_sent'] = 1 if "Yes" in re.search(r"Reminder Sent:\s*(.*)", text).group(1).strip() else 0
+        data['notes'] = re.search(r"Notes:\s*(.*)", text).group(1).strip()
+
+        return data
+    except (AttributeError, ValueError) as e:
+        print(f"Error parsing data: {e}")
+        print("Raw text from PDF:")
+        print(text)
+        raise
+
+def generate_username_password(first_name, last_name):
+    username = first_name.lower() + '.' + last_name.lower() + str(random.randint(1000, 9999))
+    password = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    return username, password
+
+def hash_password(password):
+    salt = bcrypt.gensalt()
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), salt)
+    return hashed_password
+
+async def send_credentials_to_user(email, username, password):
+    try:
+        subject = "Welcome to Our Healthcare System"
+        body = f"""
+        Hello,
+
+        This email is to inform you that you have been added as a client to our healthcare system.
+
+        Our healthcare providers will maintain your records and keep track of your vaccinations and health status.
+
+        Best regards,
+        Your Health System
+        """
+
+        # Use the existing send_email function
+        send_email(subject, body, [email])
+        print(f"Welcome email sent successfully to {email}")
+    except Exception as e:
+        print(f"Failed to send email: {e}")
+        # Don't raise the exception, just log it
+        pass
+
+# Add new endpoint for PDF upload
+@app.post("/provider/upload-client-pdf")
+async def upload_client_pdf(
+    pdf_file: UploadFile = File(...),
+    current_provider: dict = Depends(get_current_provider)
+):
+    try:
+        # Create a temporary file to store the uploaded PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
+            content = await pdf_file.read()
+            temp_pdf.write(content)
+            temp_pdf_path = temp_pdf.name
+
+        try:
+            # Extract and parse data from PDF
+            text = extract_text_from_pdf(temp_pdf_path)
+            data = parse_text_to_data(text)
+            print(data)
+            
+            # Check if child with this SSN exists in the database
+            check_ssn_query = "SELECT ssn FROM Children WHERE ssn = :ssn"
+            existing_ssn = await database.fetch_one(check_ssn_query, values={"ssn": int(data['ssn'])})
+            print(existing_ssn)
+            
+            if existing_ssn:
+                print("Child already exists")
+                return {
+                    "status": "exists",
+                    "message": "The child is already present in your records."
+                }
+
+            # If SSN not found, proceed with adding new record
+            # Generate username and password
+            username, password = generate_username_password(data["first_name"], data["last_name"])
+            hashed_password = hash_password(password)
+
+            # Insert new child with provider_id
+            insert_query = """
+            INSERT INTO Children (
+                first_name, last_name, date_of_birth, gender,
+                blood_type, pincode, email, username, password_hash,
+                ssn, provider_id
+            ) VALUES (
+                :first_name, :last_name, :dob, :gender,
+                :blood_type, :pincode, :email, :username, :password_hash,
+                :ssn, :provider_id
+            )
+            """
+            values = {
+                **data,
+                "username": username,
+                "password_hash": hashed_password,
+                "provider_id": current_provider["provider_id"]
+            }
+            
+            await database.execute(query=insert_query, values=values)
+
+            # Send welcome email to the user
+            await send_credentials_to_user(data["email"], username, password)
+
+            return {
+                "status": "success",
+                "message": "New child record has been successfully added to the database."
+            }
+
+        except Exception as e:
+            print(f"Error processing PDF: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+        finally:
+            # Clean up temporary file
+            if os.path.exists(temp_pdf_path):
+                os.remove(temp_pdf_path)
+
+    except Exception as e:
+        print(f"Error uploading PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Add middleware to ensure database connection
+@app.middleware("http")
+async def db_session_middleware(request: Request, call_next):
+    try:
+        # Ensure database is connected
+        if not database.is_connected:
+            await database.connect()
+            print("Database reconnected in middleware")
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        print(f"Error in database middleware: {str(e)}")
+        raise
+    finally:
+        if database.is_connected:
+            print("Database connection maintained")
+
+async def generate_ehr_pdf(child_id: int, provider_id: int) -> str:
+    try:
+        # First verify that this provider has access to this child's records
+        access_query = "SELECT * FROM Children WHERE child_id = :child_id AND provider_id = :provider_id"
+        child = await database.fetch_one(
+            query=access_query,
+            values={"child_id": child_id, "provider_id": provider_id}
+        )
+        
+        if not child:
+            raise HTTPException(
+                status_code=403,
+                detail="You do not have access to this child's records"
+            )
+
+        # Fetch vaccination history
+        vaccination_query = """
+        SELECT 
+            vaccine_name,
+            dose_number,
+            date_administered,
+            administered_by,
+            reminder_sent,
+            notes
+        FROM VaccinationTakenRecords
+        WHERE child_id = :child_id
+        ORDER BY date_administered DESC
+        """
+        vaccination_records = await database.fetch_all(
+            query=vaccination_query,
+            values={"child_id": child_id}
+        )
+
+        # Create PDF
+        pdf_path = f"/tmp/ehr_{child_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+
+        # Title
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            spaceAfter=30
+        )
+        story.append(Paragraph("Electronic Health Record", title_style))
+        story.append(Spacer(1, 12))
+
+        # Child Details
+        story.append(Paragraph("Child Details", styles["Heading2"]))
+        child_data = [
+            ["First Name:", child["first_name"]],
+            ["Last Name:", child["last_name"]],
+            ["Date of Birth:", child["date_of_birth"].strftime("%Y-%m-%d")],
+            ["Gender:", child["gender"]],
+            ["Blood Type:", child["blood_type"]],
+            ["Pincode:", child["pincode"]],
+            ["Email:", child["email"]],
+            ["SSN:", child["ssn"]]
+        ]
+        child_table = Table(child_data, colWidths=[2*inch, 4*inch])
+        child_table.setStyle(TableStyle([
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            ('BACKGROUND', (1, 0), (-1, -1), colors.white),
+            ('FONTNAME', (1, 0), (-1, -1), 'Helvetica'),
+        ]))
+        story.append(child_table)
+        story.append(Spacer(1, 20))
+
+        # Vaccination History
+        story.append(Paragraph("Vaccination History", styles["Heading2"]))
+        if vaccination_records:
+            vac_data = [["Vaccine Name", "Dose", "Date", "Administered By", "Notes"]]
+            for record in vaccination_records:
+                vac_data.append([
+                    record["vaccine_name"],
+                    str(record["dose_number"]),
+                    record["date_administered"].strftime("%Y-%m-%d"),
+                    record["administered_by"],
+                    record["notes"] or ""
+                ])
+            vac_table = Table(vac_data, colWidths=[2*inch, 0.7*inch, 1.3*inch, 1.5*inch, 2*inch])
+            vac_table.setStyle(TableStyle([
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+            ]))
+            story.append(vac_table)
+        else:
+            story.append(Paragraph("No vaccination records found.", styles["Normal"]))
+
+        # Build PDF
+        doc.build(story)
+        return pdf_path
+
+    except Exception as e:
+        print(f"Error generating EHR PDF: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating EHR PDF: {str(e)}"
+        )
+
+async def get_child_by_ssn(ssn: str, provider_id: int):
+    """Get child details by SSN, ensuring provider has access"""
+    try:
+        # If only last 4 digits provided, search with LIKE
+        if len(ssn) == 4:
+            query = "SELECT * FROM Children WHERE ssn LIKE :ssn_pattern AND provider_id = :provider_id"
+            values = {"ssn_pattern": f"%{ssn}", "provider_id": provider_id}
+        else:
+            query = "SELECT * FROM Children WHERE ssn = :ssn AND provider_id = :provider_id"
+            values = {"ssn": ssn, "provider_id": provider_id}
+        
+        return await database.fetch_one(query=query, values=values)
+    except Exception as e:
+        print(f"Error in get_child_by_ssn: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving child record: {str(e)}"
+        )
+
+@app.post("/provider/generate-ehr")
+async def generate_and_email_ehr(
+    ssn: str = Query(..., description="Child's SSN"),
+    current_provider: dict = Depends(get_current_provider)
+):
+    """Generate and email EHR for a child"""
+    try:
+        # Get child details
+        child = await get_child_by_ssn(ssn, current_provider["provider_id"])
+        if not child:
+            raise HTTPException(
+                status_code=404,
+                detail="Child not found or you don't have access to their records"
+            )
+
+        # Generate PDF
+        pdf_path = await generate_ehr_pdf(child["child_id"], current_provider["provider_id"])
+
+        # Send email with PDF attachment
+        subject = f"Electronic Health Record - {child['first_name']} {child['last_name']}"
+        body = f"""
+        Dear Dr. {current_provider['provider_name']},
+
+        Please find attached the Electronic Health Record for {child['first_name']} {child['last_name']}.
+
+        Best regards,
+        Your Health System
+        """
+
+        # Read PDF file
+        with open(pdf_path, "rb") as pdf_file:
+            pdf_content = pdf_file.read()
+
+        # Send email with PDF attachment
+        send_email(
+            subject=subject,
+            body=body,
+            to_emails=[current_provider["email"]],
+            attachments=[{
+                "filename": f"EHR_{child['first_name']}_{child['last_name']}.pdf",
+                "content": pdf_content,
+                "content_type": "application/pdf"
+            }]
+        )
+
+        # Clean up
+        os.remove(pdf_path)
+
+        return {
+            "status": "success",
+            "message": f"EHR has been generated and sent to {current_provider['email']}"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error generating and emailing EHR: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generating and emailing EHR: {str(e)}"
         )
