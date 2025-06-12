@@ -12,7 +12,7 @@ from fastapi import HTTPException, status, Depends
 from fastapi.security import OAuth2PasswordRequestForm
 from datetime import datetime, timedelta
 import re
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import io
 import openai
 import json
@@ -54,6 +54,7 @@ from reportlab.lib.units import inch
 from email import encoders
 from email.mime.base import MIMEBase
 import shutil
+from fastapi.staticfiles import StaticFiles
 
 # Database configuration
 DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/ChildHealth"
@@ -102,6 +103,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Create static directory for PDFs if it doesn't exist
+os.makedirs("static/pdfs", exist_ok=True)
+
+# Mount static files directory
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Initialize SQLAlchemy engine
 engine = create_engine(SYNC_DATABASE_URL)
@@ -579,25 +586,13 @@ def parse_iso_datetime(iso_str: str) -> str:
     dt = datetime.fromisoformat(iso_str)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
-def send_email(subject: str, body: str, to_emails: List[str], attachments: List[Dict] = None):
-    """
-    Send an email with optional attachments using Gmail SMTP
-    
-    Args:
-        subject: Email subject
-        body: Email body
-        to_emails: List of recipient email addresses
-        attachments: List of dictionaries with keys:
-            - filename: Name of the file
-            - content: Binary content of the file
-            - content_type: MIME type of the file
-    """
+async def send_email(subject: str, body: str, to_emails: List[str], attachments: List[Dict] = None):
+    """Send email with optional attachments"""
     try:
-        # Create message container
         msg = MIMEMultipart()
         msg['Subject'] = subject
         msg['From'] = EMAIL_FROM
-        msg['To'] = ", ".join(to_emails)
+        msg['To'] = ', '.join(to_emails)
 
         # Add body
         msg.attach(MIMEText(body, 'plain'))
@@ -605,37 +600,25 @@ def send_email(subject: str, body: str, to_emails: List[str], attachments: List[
         # Add attachments if any
         if attachments:
             for attachment in attachments:
-                part = MIMEBase('application', 'octet-stream')
-                part.set_payload(attachment['content'])
-                encoders.encode_base64(part)
-                part.add_header(
-                    'Content-Disposition',
-                    f'attachment; filename="{attachment["filename"]}"'
-                )
-                if 'content_type' in attachment:
-                    part.set_type(attachment['content_type'])
-                msg.attach(part)
+                with open(attachment['path'], 'rb') as f:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(f.read())
+                    encoders.encode_base64(part)
+                    
+                    # Add header
+                    part.add_header(
+                        'Content-Disposition',
+                        f'attachment; filename="{attachment["filename"]}"'
+                    )
+                    msg.attach(part)
 
-        # Send email using Gmail SMTP with proper error handling
-        try:
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-                server.starttls()
-                server.login(SMTP_USERNAME, SMTP_PASSWORD)
-                server.send_message(msg)
-                print(f"Email sent successfully to {to_emails}")
-        except smtplib.SMTPAuthenticationError:
-            print("SMTP Authentication Error: Invalid credentials")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to authenticate with email server"
-            )
-        except smtplib.SMTPException as smtp_error:
-            print(f"SMTP Error: {str(smtp_error)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"SMTP Error: {str(smtp_error)}"
-            )
+        # Connect to SMTP server and send email
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.send_message(msg)
 
+        return True
     except Exception as e:
         print(f"Failed to send email: {str(e)}")
         raise HTTPException(
@@ -2035,55 +2018,59 @@ class AgentQueryRequest(BaseModel):
 @app.post("/agent/query/provider")
 async def agent_query_provider(
     request: AgentQueryRequest,
+    background_tasks: BackgroundTasks,
     current_provider=Depends(get_current_provider)
 ):
-    """Process a query specifically for healthcare providers"""
+    """Handle provider agent queries"""
     try:
-        print("\n=== Processing Provider Query ===")
-        print(f"Input query: {request.query}")
-        
-        # Validate query
-        if not request.query or len(request.query.strip()) == 0:
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-        
-        # Process the query using the new approach
+        # Process the query
         response = await process_agent_query(
             query=request.query,
-            current_provider=current_provider
+            current_provider=current_provider,
+            background_tasks=background_tasks
         )
         
-        # Create the base response
-        result = {
-            "text_response": response["message"],
-            "success": True,
-            "audio_response": None,
-            "query_understood": request.query,
-            "data": response.get("data")
+        # Initialize response data
+        response_data = {
+            "response": response.get("message", ""),
+            "type": response.get("type", "text"),
+            "data": response.get("data", {})
         }
-        
-        # Only attempt TTS if requested and we have a text response
-        if request.return_audio and result["text_response"]:
+
+        # If it's an EHR request with a PDF URL, format it for better display
+        if response.get("type") == "ehr_request" and response.get("data", {}).get("pdf_url"):
+            pdf_url = response["data"]["pdf_url"]
+            patient_name = response["data"]["patient_name"]
+            response_data["response"] = (
+                f"I've generated the EHR for {patient_name} and it's being sent to your email.\n\n"
+                f"📄 <a href='{pdf_url}' target='_blank'>Click here to view the PDF</a>"
+            )
+            response_data["has_html"] = True
+
+        # Generate audio if requested
+        if request.return_audio:
             try:
-                audio_response = openai_client.audio.speech.create(
+                # Use plain text version for TTS
+                tts_text = response_data["response"]
+                if response_data.get("has_html"):
+                    # Strip HTML for TTS
+                    tts_text = re.sub(r'<[^>]+>', '', tts_text)
+                
+                audio = openai_client.audio.speech.create(
                     model="tts-1",
                     voice="nova",
-                    input=result["text_response"]
+                    input=tts_text
                 )
-                result["audio_response"] = base64.b64encode(audio_response.content).decode()
-                print("TTS conversion successful")
+                response_data["audio"] = base64.b64encode(audio.content).decode()
             except Exception as e:
-                print(f"\n=== TTS Error ===")
-                print(f"Error details: {str(e)}")
-                result["tts_error"] = str(e)
+                print(f"Error generating audio: {str(e)}")
+                # Continue without audio if TTS fails
+
+        return response_data
         
-        return result
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        print(f"\n=== Endpoint Error ===")
-        print(f"Error processing provider query: {str(e)}")
-        print(f"Traceback: {traceback.format_exc()}")
+        print(f"Error in agent query: {str(e)}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -2092,40 +2079,32 @@ async def agent_query_provider(
 @app.post("/agent/query/user")
 async def agent_query_user(
     request: AgentQueryRequest,
+    background_tasks: BackgroundTasks,
     current_user=Depends(get_current_user)
 ):
-    """Process a query through the healthcare agent for users/patients"""
+    """Process a user query through the agent"""
     try:
-        if not request.query or len(request.query.strip()) == 0:
-            raise HTTPException(status_code=400, detail="Query cannot be empty")
-            
+        # Process the query
         response = await process_agent_query(
             query=request.query,
+            background_tasks=background_tasks,
             current_user=current_user
         )
         
-        result = {
-            "text_response": response["message"],
-            "success": True,
-            "audio_response": None,
-            "query_understood": request.query,
-            "data": response.get("data")
-        }
+        # Generate audio response if requested
+        if request.return_audio:
+            audio_response = await text_to_speech(TTSRequest(text=response["message"]))
+            response["audio"] = audio_response.get("audio")
+            
+        return response
         
-        if request.return_audio and result["text_response"]:
-            try:
-                audio_response = openai_client.audio.speech.create(
-                    model="tts-1",
-                    voice="nova",
-                    input=result["text_response"]
-                )
-                result["audio_response"] = base64.b64encode(audio_response.content).decode()
-            except Exception as e:
-                result["tts_error"] = str(e)
-        
-        return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error processing user query: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing user query: {str(e)}"
+        )
 
 @app.post("/agent/clear")
 async def clear_agent_conversation(current_user=Depends(get_current_user)):
@@ -2200,220 +2179,148 @@ async def text_to_speech(request: TTSRequest):
             detail="An unexpected error occurred while processing the request"
         )
 
-@app.post("/agent/query")
+async def process_other_queries(query: str, current_provider=None, current_user=None):
+    """Process non-EHR queries"""
+    cleaned_query = query.lower().strip()
+    response_text = []
+    response_data = {}
+
+    # Define keywords for different query types
+    appointment_keywords = ["appointment", "appointments", "schedule", "scheduled", "visit"]
+    vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization"]
+    health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease"]
+    
+    # Check query types
+    is_appointment_query = any(keyword in cleaned_query for keyword in appointment_keywords)
+    is_vaccination_query = any(keyword in cleaned_query for keyword in vaccination_keywords)
+    is_health_alert_query = any(keyword in cleaned_query for keyword in health_alert_keywords)
+    
+    # Handle appointments
+    if is_appointment_query and current_provider:
+        appointments = await get_provider_appointments("week", current_provider)
+        if appointments:
+            response_text.append("\n📅 Upcoming Appointments:")
+            for date, appts in appointments.items():
+                response_text.append(f"\n{date}:")
+                for appt in appts:
+                    response_text.append(f"• {appt['time']} - {appt['patient_name']}: {appt['appointment_type']}")
+        else:
+            response_text.append("\nNo upcoming appointments found.")
+        response_data["appointments"] = appointments
+    
+    # Handle vaccinations
+    if is_vaccination_query and current_provider:
+        overdue = await get_overdue_vaccinations(current_provider)
+        if overdue:
+            response_text.append("\n🚨 Overdue Vaccinations:")
+            for vacc in overdue[:5]:
+                response_text.append(f"• {vacc['child_name']}: {vacc['vaccine_name']} (Dose {vacc['dose_number']})")
+        else:
+            response_text.append("\nNo overdue vaccinations found.")
+        response_data["vaccinations"] = overdue
+    
+    # Handle health alerts
+    if is_health_alert_query and current_provider:
+        alerts = await get_provider_local_health_alerts(current_provider)
+        if alerts.get("alerts"):
+            response_text.append("\n🏥 Recent Health Alerts:")
+            for alert in alerts["alerts"][:5]:
+                response_text.append(f"• {alert['disease']} - {alert['confidence']}% confidence")
+        else:
+            response_text.append("\nNo recent health alerts found.")
+        response_data["alerts"] = alerts.get("alerts", [])
+    
+    # If no specific query type matched
+    if not any([is_appointment_query, is_vaccination_query, is_health_alert_query]):
+        return {
+            "message": "I can help you with:\n• Appointments\n• Vaccinations\n• Health Alerts\n• Electronic Health Records (EHR)\n\nPlease specify what you'd like to know about.",
+            "type": "help"
+        }
+    
+    return {
+        "message": "\n".join(response_text) if response_text else "I processed your request but found no relevant information.",
+        "type": "combined",
+        "data": response_data
+    }
+
 async def process_agent_query(
     query: str = Query(..., description="The query to process"),
     current_provider=None,
-    current_user=None
+    current_user=None,
+    background_tasks: BackgroundTasks = None
 ):
-    """Process a query through the healthcare agent"""
+    """Process a query from the agent"""
     try:
-        # Check query type based on keywords
-        appointment_keywords = ["appointment", "appointments", "schedule", "scheduled", "visit", "visits", "meeting", "consultation"]
-        today_keywords = ["today", "today's", "todays", "current day"]
-        vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization", "shot", "shots", "dose", "doses"]
-        health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease", "warning", "notifications"]
-        vaccination_record_keywords = ["has taken", "received", "administered", "given", "took", "got"]
-        ehr_keywords = ["ehr", "electronic health record", "health record", "medical record", "patient record", "fetch", "get", "send", "vaccination record"]
-        child_variations = ["child", "chill", "children", "kid", "patient"]
-        mmr_check_keywords = ["measles", "not vaccinated", "haven't received", "missing mmr", "has not taken"]
-
+        print("\n=== Processing Provider Query ===")
+        print(f"Input query: {query}")
+        
         # Clean up the query
         cleaned_query = query.lower().strip()
-
-        # Check for MMR/measles vaccination query
-        is_mmr_query = (
-            ("mmr" in cleaned_query or "measles" in cleaned_query) and
-            not any(kw in cleaned_query for kw in vaccination_record_keywords)
-        )
-
-        if is_mmr_query and current_provider:
-            # Query to find children assigned to the provider who haven't received MMR vaccination
-            query = """
-            SELECT DISTINCT 
-                c.child_id,
-                c.first_name,
-                c.last_name,
-                c.date_of_birth,
-                c.email
-            FROM Children c
-            LEFT JOIN VaccinationTakenRecords vtr 
-                ON c.child_id = vtr.child_id 
-                AND vtr.vaccine_name = 'MMR'
-            WHERE c.provider_id = :provider_id
-            AND vtr.record_id IS NULL
-            ORDER BY c.last_name, c.first_name;
-            """
-            
-            unvaccinated_children = await database.fetch_all(
-                query=query,
-                values={"provider_id": current_provider["provider_id"]}
-            )
-            
-            if unvaccinated_children:
-                response_text = ["\n🚨 Clients Missing MMR Vaccination:"]
-                for child in unvaccinated_children:
-                    dob = datetime.strptime(child["date_of_birth"].strftime('%Y-%m-%d'), '%Y-%m-%d')
-                    age_months = (datetime.now() - dob).days // 30
-                    response_text.append(f"• {child['first_name']} {child['last_name']} (Age: {age_months} months)")
-                    if child["email"]:
-                        response_text.append(f"  Contact: {child['email']}")
-            else:
-                response_text = ["\nAll your clients have received their MMR vaccination."]
-            
-            return {
-                "message": "\n".join(response_text),
-                "type": "mmr_check",
-                "data": {
-                    "unvaccinated_children": [
-                        {
-                            "name": f"{child['first_name']} {child['last_name']}",
-                            "age_months": (datetime.now() - datetime.strptime(child["date_of_birth"].strftime('%Y-%m-%d'), '%Y-%m-%d')).days // 30,
-                            "email": child["email"]
-                        }
-                        for child in unvaccinated_children
-                    ]
-                }
-            }
-
-        # Handle vaccination recording
-        ssn_match = re.search(r"(?:with|ssn|client|patient)\s*(?:the|ssn|number|#)?\s*(\d{4})", cleaned_query)
-        vaccine_match = re.search(r"(?:vaccination|vaccine)?\s*(mmr|measles|mumps|rubella)\s*(?:vaccination|vaccine)?", cleaned_query, re.IGNORECASE)
-
-        if ssn_match and vaccine_match:
-            ssn = ssn_match.group(1)
-            vaccine_name = "MMR"  # Standardize to MMR
-            dose_number = 1  # Default to dose 1 if not specified
-            
-            # Check if child exists and belongs to the current provider
-            check_child_query = """
-            SELECT child_id, first_name, last_name, provider_id 
-            FROM Children 
-            WHERE ssn = :ssn
-            """
-            existing_child = await database.fetch_one(check_child_query, values={"ssn": int(ssn)})
-            
-            if not existing_child:
-                return {
-                    "status": "error",
-                    "message": f"No child found with SSN {ssn} in the database."
-                }
-            
-            if existing_child["provider_id"] != current_provider["provider_id"]:
-                return {
-                    "status": "error",
-                    "message": "This child is not your client."
-                }
-
-            # Record vaccination
-            insert_query = """
-            INSERT INTO VaccinationTakenRecords (
-                child_id, vaccine_name, dose_number,
-                date_administered, administered_by, notes
-            ) VALUES (
-                :child_id, :vaccine_name, :dose_number,
-                CURDATE(), :administered_by, :notes
-            )
-            """
-            await database.execute(
-                insert_query,
-                values={
-                    "child_id": existing_child["child_id"],
-                    "vaccine_name": vaccine_name,
-                    "dose_number": dose_number,
-                    "administered_by": current_provider["provider_name"],
-                    "notes": f"Recorded via voice assistant by {current_provider['provider_name']}"
-                }
-            )
-
-            return {
-                "status": "success",
-                "message": f"Successfully recorded {vaccine_name} vaccination for {existing_child['first_name']} {existing_child['last_name']}"
-            }
-
-        # Handle other query types...
+        
+        # Define all keywords for different query types
+        appointment_keywords = ["appointment", "appointments", "schedule", "scheduled", "visit"]
+        today_keywords = ["today", "today's", "todays", "current day"]
+        vaccination_keywords = ["vaccine", "vaccination", "overdue", "pending", "immunization"]
+        health_alert_keywords = ["alert", "alerts", "health alert", "outbreak", "disease"]
+        vaccination_record_keywords = ["has taken", "received", "administered", "given", "took", "got"]
+        ehr_keywords = ["ehr", "electronic health record", "health record", "medical record", "patient record", "fetch", "get", "send"]
+        mmr_check_keywords = ["measles", "not vaccinated", "haven't received", "missing mmr", "has not taken"]
+        
+        # Check query types
         is_appointment_query = any(keyword in cleaned_query for keyword in appointment_keywords)
         is_today_query = any(keyword in cleaned_query for keyword in today_keywords)
         is_vaccination_query = any(keyword in cleaned_query for keyword in vaccination_keywords)
         is_health_alert_query = any(keyword in cleaned_query for keyword in health_alert_keywords)
         is_vaccination_record = any(keyword in cleaned_query for keyword in vaccination_record_keywords)
         is_ehr_request = any(keyword in cleaned_query for keyword in ehr_keywords)
+        is_mmr_query = (
+            ("mmr" in cleaned_query or "measles" in cleaned_query) and
+            not any(kw in cleaned_query for kw in vaccination_record_keywords)
+        )
 
-        response_data = {}
+        # Initialize response
         response_text = []
+        response_data = {}
 
-        # Handle EHR request
-        if is_ehr_request and current_provider:
-            # Try to extract SSN from the query
-            ssn_pattern = r"ssn\s*(\d{4}|\d{9})"
-            ssn_match = re.search(ssn_pattern, cleaned_query)
-            
-            if ssn_match:
-                ssn = ssn_match.group(1)
-                # Generate and email EHR
-                try:
-                    result = await generate_and_email_ehr(ssn=ssn, current_provider=current_provider)
-                    response_text.append(result["message"])
-                    response_data["ehr_generated"] = True
-                    
-                    return {
-                        "message": "\n".join(response_text),
-                        "type": "ehr_request",
-                        "data": response_data
-                    }
-                except HTTPException as e:
-                    response_text.append(f"Error: {e.detail}")
-                    response_data["ehr_generated"] = False
-                    
-                    return {
-                        "message": "\n".join(response_text),
-                        "type": "ehr_request",
-                        "data": response_data
-                    }
-            else:
-                response_text.append("Please provide the child's SSN (last 4 digits) to fetch their EHR.")
-                response_data["ehr_generated"] = False
-                
-                return {
-                    "message": "\n".join(response_text),
-                    "type": "ehr_request",
-                    "data": response_data
-                }
-
-        # Handle vaccination recording
+        # Handle vaccination recording first
         if is_vaccination_record and current_provider:
+            print("\n=== Processing Vaccination Record ===")
             # Extract SSN and vaccine details
-            ssn_pattern = r"ssn\s*(\d{4}|\d{9})"
-            vaccine_pattern = r"(?:taken|received|got|has taken)\s+(?:vaccination\s+)?([\w\s-]+?)(?:\s+(?:vaccine|vaccination|shot))?\s*(?:(?:dose\s+(?:(\d+)|one|two|three|four|five|six))?)?\s*(?:today)"
+            ssn_pattern = r"(?:with|ssn|client|patient)\s*(?:the|ssn|number|#)?\s*(\d{4})"
+            vaccine_pattern = r"(?:has taken|received|got|took|given|administered)\s+(?:vaccination|vaccine)?\s*(\w+(?:\s*\w+)*?)(?:\s*(?:vaccine|vaccination|shot))?\s*(?:dose\s+(?:(\d+)|one|two|three|four|five|six))?\s*(?:today)?"
             
-            print(f"Processing query: {cleaned_query}")  # Debug log
-            
+            print(f"Query: {cleaned_query}")
             ssn_match = re.search(ssn_pattern, cleaned_query)
             vaccine_match = re.search(vaccine_pattern, cleaned_query, re.IGNORECASE)
             
-            print(f"SSN match: {ssn_match is not None}")  # Debug log
-            print(f"Vaccine match: {vaccine_match is not None}")  # Debug log
+            print(f"SSN Match: {ssn_match.group(1) if ssn_match else None}")
+            print(f"Vaccine Match: {vaccine_match.groups() if vaccine_match else None}")
             
             if ssn_match and vaccine_match:
                 ssn = ssn_match.group(1)
+                # Extract and clean vaccine name, preserving multi-word names
                 vaccine_name = vaccine_match.group(1).strip().upper()
-                # Remove any extra words that might have been captured
-                vaccine_name = re.sub(r'\b(VACCINATION|VACCINE|SHOT)\b', '', vaccine_name).strip()
+                print(f"Extracted vaccine name: {vaccine_name}")
                 
-                # Handle dose number
-                dose_word = vaccine_match.group(2)
-                if dose_word:  # If a dose was specified
-                    if dose_word.isdigit():
-                        dose_number = int(dose_word)
-                    else:
-                        word_to_num = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6}
-                        dose_number = word_to_num.get(dose_word.lower(), 1)
+                # Special handling for common vaccine names
+                common_vaccines = ["MMR", "DTAP", "TDAP", "HEPB", "IPV"]
+                if vaccine_name in common_vaccines:
+                    print(f"Found common vaccine: {vaccine_name}")
                 else:
-                    dose_number = 1  # Default to dose 1 if not specified
+                    # Remove extra words for other vaccines
+                    vaccine_name = re.sub(r'\b(VACCINATION|VACCINE|SHOT)\b', '', vaccine_name).strip()
+                    print(f"Cleaned vaccine name: {vaccine_name}")
                 
-                print(f"Extracted SSN: {ssn}")  # Debug log
-                print(f"Extracted vaccine: {vaccine_name}")  # Debug log
-                print(f"Extracted dose: {dose_number}")  # Debug log
+                # Default to dose 1 if not specified
+                dose_number = 1
+                if len(vaccine_match.groups()) > 1 and vaccine_match.group(2):
+                    dose_str = vaccine_match.group(2)
+                    if dose_str and dose_str.isdigit():
+                        dose_number = int(dose_str)
+                    elif dose_str:
+                        word_to_num = {'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6}
+                        dose_number = word_to_num.get(dose_str.lower(), 1)
+                print(f"Dose number: {dose_number}")
                 
                 # Verify child exists and belongs to this provider
                 child_query = """
@@ -2425,65 +2332,275 @@ async def process_agent_query(
                 child = await database.fetch_one(
                     child_query, 
                     values={
-                        "ssn_pattern": f"%{ssn}" if len(ssn) == 4 else ssn,
+                        "ssn_pattern": f"%{ssn}",
                         "provider_id": current_provider["provider_id"]
                     }
                 )
+                print(f"Found child: {child['first_name'] if child else None}")
                 
                 if child:
-                    # Insert vaccination record
-                    insert_query = """
-                    INSERT INTO VaccinationTakenRecords (
-                        child_id, vaccine_name, dose_number, 
-                        date_administered, administered_by, notes
-                    ) VALUES (
-                        :child_id, :vaccine_name, :dose_number,
-                        CURDATE(), :administered_by, :notes
-                    )
+                    # Check if this vaccination record already exists
+                    check_query = """
+                    SELECT record_id 
+                    FROM VaccinationTakenRecords 
+                    WHERE child_id = :child_id 
+                    AND vaccine_name = :vaccine_name 
+                    AND dose_number = :dose_number
+                    AND DATE(date_administered) = CURDATE()
                     """
-                    await database.execute(
-                        insert_query,
+                    existing_record = await database.fetch_one(
+                        check_query,
                         values={
                             "child_id": child["child_id"],
                             "vaccine_name": vaccine_name,
-                            "dose_number": dose_number,
-                            "administered_by": current_provider["provider_name"],
-                            "notes": f"Recorded via voice assistant by {current_provider['provider_name']}"
+                            "dose_number": dose_number
                         }
                     )
                     
-                    response_text.append(f"Successfully recorded that {child['first_name']} {child['last_name']} has received {vaccine_name} dose {dose_number} today.")
-                    response_data["vaccination_recorded"] = True
+                    if existing_record:
+                        print("Found existing record for today")
+                        return {
+                            "message": f"⚠️ This vaccination record already exists for {child['first_name']} {child['last_name']} (today's date).",
+                            "type": "vaccination_record",
+                            "data": {"vaccination_recorded": False}
+                        }
+                    
+                    try:
+                        # Insert vaccination record
+                        insert_query = """
+                        INSERT INTO VaccinationTakenRecords (
+                            child_id, vaccine_name, dose_number, 
+                            date_administered, administered_by, notes
+                        ) VALUES (
+                            :child_id, :vaccine_name, :dose_number,
+                            CURDATE(), :administered_by, :notes
+                        )
+                        """
+                        await database.execute(
+                            insert_query,
+                            values={
+                                "child_id": child["child_id"],
+                                "vaccine_name": vaccine_name,
+                                "dose_number": dose_number,
+                                "administered_by": current_provider["provider_name"],
+                                "notes": f"Recorded via voice assistant by {current_provider['provider_name']}"
+                            }
+                        )
+                        print("Successfully inserted vaccination record")
+                        
+                        return {
+                            "message": f"✅ Successfully recorded that {child['first_name']} {child['last_name']} has received {vaccine_name} dose {dose_number} today.",
+                            "type": "vaccination_record",
+                            "data": {"vaccination_recorded": True}
+                        }
+                    except Exception as e:
+                        print(f"Error inserting vaccination record: {str(e)}")
+                        return {
+                            "message": f"❌ Error recording vaccination: {str(e)}",
+                            "type": "error",
+                            "data": {"vaccination_recorded": False}
+                        }
                 else:
-                    response_text.append(f"I could not find a child with SSN ending in {ssn} in your records. You can only record vaccinations for your assigned patients.")
-                    response_data["vaccination_recorded"] = False
+                    print(f"No child found with SSN {ssn}")
+                    return {
+                        "message": f"❌ I could not find a child with SSN ending in {ssn} in your records. Please verify the SSN and try again.",
+                        "type": "vaccination_record",
+                        "data": {"vaccination_recorded": False}
+                    }
+            else:
+                missing = []
+                if not ssn_match:
+                    missing.append("SSN")
+                if not vaccine_match:
+                    missing.append("vaccine details")
+                print(f"Missing information: {missing}")
                 
                 return {
-                    "message": "\n".join(response_text),
+                    "message": f"❌ Please provide both the child's {' and '.join(missing)} to record a vaccination.",
                     "type": "vaccination_record",
-                    "data": response_data
+                    "data": {"vaccination_recorded": False}
                 }
-            else:
-                response_text.append("Please provide both the child's SSN and the vaccine details.")
-                response_data["vaccination_recorded"] = False
+                
+        # Continue with other query types...
+
+        # Handle MMR vaccination check
+        if is_mmr_query and current_provider:
+            print("\n=== Processing MMR Vaccination Check ===")
+            print(f"Provider ID: {current_provider['provider_id']}")
+            
+            try:
+                # Query to find children who haven't received MMR vaccine
+                unvaccinated_query = """
+                SELECT 
+                    c.child_id,
+                    c.first_name,
+                    c.last_name,
+                    c.date_of_birth,
+                    TIMESTAMPDIFF(MONTH, c.date_of_birth, CURDATE()) as age_months
+                FROM Children c
+                WHERE c.provider_id = :provider_id
+                AND NOT EXISTS (
+                    SELECT 1 
+                    FROM VaccinationTakenRecords vtr 
+                    WHERE vtr.child_id = c.child_id 
+                    AND UPPER(vtr.vaccine_name) = 'MMR'
+                )
+                ORDER BY c.last_name, c.first_name;
+                """
+                
+                print("Executing query to find unvaccinated children...")
+                unvaccinated_children = await database.fetch_all(
+                    unvaccinated_query,
+                    values={"provider_id": current_provider["provider_id"]}
+                )
+                print(f"Query executed successfully. Found {len(unvaccinated_children) if unvaccinated_children else 0} results")
+                
+                if not unvaccinated_children:
+                    return {
+                        "message": "✅ All your registered clients have received their MMR vaccination.",
+                        "type": "vaccination_check",
+                        "data": {"unvaccinated_count": 0}
+                    }
+                
+                # Format the response
+                child_list = []
+                for child in unvaccinated_children:
+                    age_str = f"{child['age_months']} months" if child['age_months'] < 24 else f"{child['age_months'] // 12} years"
+                    child_list.append(f"• {child['first_name']} {child['last_name']} (Age: {age_str})")
+                    print(f"Processing child: {child['first_name']} {child['last_name']}")
+                
+                response_text = "⚠️ The following clients have not received MMR vaccination:\n\n" + "\n".join(child_list)
+                
                 return {
-                    "message": "\n".join(response_text),
-                    "type": "vaccination_record",
-                    "data": response_data
+                    "message": response_text,
+                    "type": "vaccination_check",
+                    "data": {
+                        "unvaccinated_count": len(unvaccinated_children),
+                        "children": [
+                            {
+                                "name": f"{child['first_name']} {child['last_name']}",
+                                "age_months": child['age_months']
+                            }
+                            for child in unvaccinated_children
+                        ]
+                    }
+                }
+                
+            except Exception as e:
+                print(f"\nError in MMR vaccination check:")
+                print(f"Error type: {type(e).__name__}")
+                print(f"Error message: {str(e)}")
+                print(f"Provider details: {current_provider}")
+                
+                # Check if database is connected
+                try:
+                    await database.fetch_one("SELECT 1")
+                    print("Database connection is working")
+                except Exception as db_error:
+                    print(f"Database connection error: {str(db_error)}")
+                
+                return {
+                    "message": "❌ Error: Failed to fetch clients without MMR vaccine. Please try again.",
+                    "type": "error",
+                    "data": {
+                        "error": str(e),
+                        "error_type": type(e).__name__
+                    }
                 }
 
-        # Handle today's appointments specifically
+        # Handle EHR request
+        if is_ehr_request and current_provider:
+            ssn_pattern = r"(?:ssn|number|#)\s*(\d{4})"
+            ssn_match = re.search(ssn_pattern, cleaned_query)
+            
+            if ssn_match:
+                ssn = ssn_match.group(1)
+                try:
+                    # Get child details
+                    query = """
+                    SELECT c.* 
+                    FROM Children c 
+                    WHERE c.ssn = :ssn
+                    """
+                    child = await database.fetch_one(query=query, values={"ssn": ssn})
+                    
+                    if not child:
+                        return {
+                            "message": f"I couldn't find a patient with SSN ending in {ssn}. Please verify the SSN and try again.",
+                            "type": "error"
+                        }
+
+                    # Generate PDF
+                    pdf_url = await generate_ehr_pdf(child["child_id"], current_provider["provider_id"])
+                    
+                    # Get the absolute path of the PDF file
+                    pdf_path = os.path.join(os.getcwd(), pdf_url.lstrip('/'))
+                    
+                    if not os.path.exists(pdf_path):
+                        return {
+                            "message": "I encountered an error generating the EHR. Please try again.",
+                            "type": "error"
+                        }
+
+                    # Extract filename from pdf_url and create full URL
+                    filename = os.path.basename(pdf_url)
+                    full_pdf_url = f"http://localhost:8000/view-pdf/{filename}"
+
+                    # Prepare email
+                    subject = f"Electronic Health Record - {child['first_name']} {child['last_name']}"
+                    body = f"""
+                    Dear {current_provider['provider_name']},
+
+                    Please find attached the Electronic Health Record for {child['first_name']} {child['last_name']}.
+                    You can also view the report directly in your browser.
+
+                    Best regards,
+                    Ask Health Team
+                    """
+
+                    # Prepare attachments
+                    attachments = [{
+                        'path': pdf_path,
+                        'filename': f"EHR_{child['first_name']}_{child['last_name']}.pdf"
+                    }]
+                    
+                    # Add email sending to background tasks
+                    if background_tasks:
+                        background_tasks.add_task(
+                            send_email,
+                            subject=subject,
+                            body=body,
+                            to_emails=[current_provider['email']],
+                            attachments=attachments
+                        )
+
+                    return {
+                        "message": f"I've generated the EHR for {child['first_name']} {child['last_name']} and it's being sent to your email.\n\nYou can view the PDF directly here: {full_pdf_url}",
+                        "type": "ehr_request",
+                        "data": {
+                            "ehr_generated": True,
+                            "pdf_url": full_pdf_url,
+                            "patient_name": f"{child['first_name']} {child['last_name']}"
+                        }
+                    }
+                except Exception as e:
+                    print(f"Error generating EHR: {str(e)}")
+                    traceback.print_exc()
+                    return {
+                        "message": "I encountered an error generating the EHR. Please try again.",
+                        "type": "error"
+                    }
+
+        # Handle today's appointments
         if is_today_query and current_provider:
             today = datetime.utcnow().date()
             query = """
             SELECT 
                 DATE_FORMAT(a.appointment_date, '%Y-%m-%dT%H:%i:%s.%fZ') as appointment_date,
-                c.first_name,
-                c.last_name,
+                c.first_name, c.last_name,
                 COALESCE(vs.vaccine_name, 'General Checkup') as vaccine_name,
                 COALESCE(vs.dose_number, 0) as dose_number,
-                a.notes,
-                a.is_general_appointment
+                a.notes, a.is_general_appointment
             FROM Appointments a
             JOIN Children c ON a.child_id = c.child_id
             LEFT JOIN VaccineSchedule vs ON a.schedule_id = vs.schedule_id
@@ -2551,7 +2668,7 @@ async def process_agent_query(
             response_data["appointments"] = appointments
 
         # Handle overdue vaccinations
-        if is_vaccination_query and current_provider:
+        if is_vaccination_query and current_provider and not is_vaccination_record:
             overdue_vaccinations = await get_overdue_vaccinations(current_provider)
             if overdue_vaccinations:
                 response_text.append("\n🚨 Overdue Vaccinations in Your Area:")
@@ -2578,21 +2695,21 @@ async def process_agent_query(
             response_data["health_alerts"] = alerts
 
         # If no specific query type matched
-        if not any([is_appointment_query, is_vaccination_query, is_health_alert_query, is_today_query, is_ehr_request]):
+        if not any([is_appointment_query, is_vaccination_query, is_health_alert_query, is_today_query, is_ehr_request, is_mmr_query]):
             return {
-                "message": "I can help you with:\n\n• Today's appointments\n• Upcoming appointments and schedules\n• Overdue vaccinations in your area\n• Local health alerts\n• Electronic Health Records (EHR)\n• Recording vaccinations\n\nPlease specify what you'd like to know about.",
-                "type": "help",
-                "data": None
+                "message": "I can help you with:\n• Today's appointments\n• Upcoming appointments\n• Overdue vaccinations\n• Health alerts\n• Electronic Health Records (EHR)\n• MMR vaccination status\n\nPlease specify what you'd like to know about.",
+                "type": "help"
             }
 
         return {
-            "message": "\n".join(response_text),
+            "message": "\n".join(response_text) if response_text else "I processed your request but found no relevant information.",
             "type": "combined",
             "data": response_data
         }
 
     except Exception as e:
         print(f"Error processing query: {str(e)}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error processing query: {str(e)}"
@@ -3519,196 +3636,247 @@ async def db_session_middleware(request: Request, call_next):
 
 async def generate_ehr_pdf(child_id: int, provider_id: int) -> str:
     try:
-        # First verify that this provider has access to this child's records
-        access_query = "SELECT * FROM Children WHERE child_id = :child_id AND provider_id = :provider_id"
-        child = await database.fetch_one(
-            query=access_query,
-            values={"child_id": child_id, "provider_id": provider_id}
-        )
-        
-        if not child:
-            raise HTTPException(
-                status_code=403,
-                detail="You do not have access to this child's records"
-            )
-
-        # Fetch vaccination history
-        vaccination_query = """
-        SELECT 
-            vaccine_name,
-            dose_number,
-            date_administered,
-            administered_by,
-            reminder_sent,
-            notes
-        FROM VaccinationTakenRecords
-        WHERE child_id = :child_id
-        ORDER BY date_administered DESC
+        # Get child information
+        query = """
+        SELECT c.*, p.provider_name, p.specialty
+        FROM Children c
+        LEFT JOIN HealthcareProviders p ON p.provider_id = :provider_id
+        WHERE c.child_id = :child_id
         """
-        vaccination_records = await database.fetch_all(
-            query=vaccination_query,
-            values={"child_id": child_id}
-        )
-
-        # Create PDF
-        pdf_path = f"/tmp/ehr_{child_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+        result = await database.fetch_one(query, {"child_id": child_id, "provider_id": provider_id})
+        
+        if not result:
+            raise HTTPException(status_code=404, detail="Child not found")
+            
+        # Get vaccination records
+        vax_query = """
+        SELECT vt.*, vs.recommended_age_months, vs.description
+        FROM VaccinationTakenRecords vt
+        LEFT JOIN VaccineSchedule vs ON vs.vaccine_name = vt.vaccine_name 
+            AND vs.dose_number = vt.dose_number
+        WHERE vt.child_id = :child_id
+        ORDER BY vt.date_administered DESC
+        """
+        vax_records = await database.fetch_all(vax_query, {"child_id": child_id})
+        
+        # Create a unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"ehr_{child_id}_{timestamp}.pdf"
+        filepath = f"static/pdfs/{filename}"
+        
+        # Generate PDF
+        doc = SimpleDocTemplate(filepath, pagesize=letter)
         styles = getSampleStyleSheet()
-        story = []
-
-        # Title
+        elements = []
+        
+        # Add title
         title_style = ParagraphStyle(
             'CustomTitle',
             parent=styles['Heading1'],
             fontSize=24,
             spaceAfter=30
         )
-        story.append(Paragraph("Electronic Health Record", title_style))
-        story.append(Spacer(1, 12))
-
-        # Child Details
-        story.append(Paragraph("Child Details", styles["Heading2"]))
-        child_data = [
-            ["First Name:", child["first_name"]],
-            ["Last Name:", child["last_name"]],
-            ["Date of Birth:", child["date_of_birth"].strftime("%Y-%m-%d")],
-            ["Gender:", child["gender"]],
-            ["Blood Type:", child["blood_type"]],
-            ["Pincode:", child["pincode"]],
-            ["Email:", child["email"]],
-            ["SSN:", child["ssn"]]
+        elements.append(Paragraph("Electronic Health Record", title_style))
+        
+        # Add child information
+        elements.append(Paragraph("Patient Information", styles["Heading2"]))
+        child_info = [
+            ["Name:", f"{result.first_name} {result.last_name}"],
+            ["Date of Birth:", result.date_of_birth.strftime("%B %d, %Y")],
+            ["Gender:", result.gender],
+            ["Blood Type:", result.blood_type],
+            ["Email:", result.email]
         ]
-        child_table = Table(child_data, colWidths=[2*inch, 4*inch])
-        child_table.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        
+        t = Table(child_info, colWidths=[2*inch, 4*inch])
+        t.setStyle(TableStyle([
             ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
             ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
             ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 12),
             ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
             ('BACKGROUND', (1, 0), (-1, -1), colors.white),
-            ('FONTNAME', (1, 0), (-1, -1), 'Helvetica'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
         ]))
-        story.append(child_table)
-        story.append(Spacer(1, 20))
-
-        # Vaccination History
-        story.append(Paragraph("Vaccination History", styles["Heading2"]))
-        if vaccination_records:
-            vac_data = [["Vaccine Name", "Dose", "Date", "Administered By", "Notes"]]
-            for record in vaccination_records:
-                vac_data.append([
-                    record["vaccine_name"],
-                    str(record["dose_number"]),
-                    record["date_administered"].strftime("%Y-%m-%d"),
-                    record["administered_by"],
-                    record["notes"] or ""
-                ])
-            vac_table = Table(vac_data, colWidths=[2*inch, 0.7*inch, 1.3*inch, 1.5*inch, 2*inch])
-            vac_table.setStyle(TableStyle([
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('FONTSIZE', (0, 0), (-1, -1), 10),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
-                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
-            ]))
-            story.append(vac_table)
-        else:
-            story.append(Paragraph("No vaccination records found.", styles["Normal"]))
-
-        # Build PDF
-        doc.build(story)
-        return pdf_path
-
-    except Exception as e:
-        print(f"Error generating EHR PDF: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error generating EHR PDF: {str(e)}"
-        )
-
-async def get_child_by_ssn(ssn: str, provider_id: int):
-    """Get child details by SSN, ensuring provider has access"""
-    try:
-        # If only last 4 digits provided, search with LIKE
-        if len(ssn) == 4:
-            query = "SELECT * FROM Children WHERE ssn LIKE :ssn_pattern AND provider_id = :provider_id"
-            values = {"ssn_pattern": f"%{ssn}", "provider_id": provider_id}
-        else:
-            query = "SELECT * FROM Children WHERE ssn = :ssn AND provider_id = :provider_id"
-            values = {"ssn": ssn, "provider_id": provider_id}
+        elements.append(t)
+        elements.append(Spacer(1, 20))
         
-        return await database.fetch_one(query=query, values=values)
+        # Add healthcare provider information
+        elements.append(Paragraph("Healthcare Provider Information", styles["Heading2"]))
+        provider_info = [
+            ["Provider Name:", result.provider_name],
+            ["Specialty:", result.specialty or "Not specified"]
+        ]
+        
+        t = Table(provider_info, colWidths=[2*inch, 4*inch])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (0, -1), colors.lightgrey),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.black),
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 12),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 12),
+            ('BACKGROUND', (1, 0), (-1, -1), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ]))
+        elements.append(t)
+        elements.append(Spacer(1, 20))
+        
+        # Add vaccination records
+        elements.append(Paragraph("Vaccination History", styles["Heading2"]))
+        if vax_records:
+            vax_data = [["Vaccine", "Dose", "Date", "Administered By", "Notes"]]
+            for record in vax_records:
+                vax_data.append([
+                    record.vaccine_name,
+                    str(record.dose_number),
+                    record.date_administered.strftime("%B %d, %Y"),
+                    record.administered_by,
+                    record.notes or ""
+                ])
+            
+            t = Table(vax_data, colWidths=[1.5*inch, 0.7*inch, 1.5*inch, 1.5*inch, 2*inch])
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('TEXTCOLOR', (0, 1), (-1, -1), colors.black),
+                ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ]))
+            elements.append(t)
+        else:
+            elements.append(Paragraph("No vaccination records found.", styles["Normal"]))
+        
+        # Build PDF
+        doc.build(elements)
+        
+        # Return the URL path for the generated PDF
+        return f"/static/pdfs/{filename}"
+        
     except Exception as e:
-        print(f"Error in get_child_by_ssn: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error retrieving child record: {str(e)}"
-        )
+        print(f"Error generating PDF: {str(e)}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to generate EHR PDF")
 
 @app.post("/provider/generate-ehr")
 async def generate_and_email_ehr(
-    ssn: str = Query(..., description="Child's SSN"),
-    current_provider: dict = Depends(get_current_provider)
+    background_tasks: BackgroundTasks,
+    current_provider: dict = Depends(get_current_provider),
+    ssn: str = Query(..., description="Child's SSN")
 ):
     """Generate and email EHR for a child"""
     try:
         # Get child details
-        child = await get_child_by_ssn(ssn, current_provider["provider_id"])
+        query = """
+        SELECT c.* 
+        FROM Children c 
+        WHERE c.ssn = :ssn
+        """
+        child = await database.fetch_one(query=query, values={"ssn": ssn})
+        
         if not child:
             raise HTTPException(
                 status_code=404,
-                detail="Child not found or you don't have access to their records"
+                detail="Child not found"
             )
 
         # Generate PDF
-        pdf_path = await generate_ehr_pdf(child["child_id"], current_provider["provider_id"])
+        pdf_url = await generate_ehr_pdf(child["child_id"], current_provider["provider_id"])
+        
+        # Get the absolute path of the PDF file
+        pdf_path = os.path.join(os.getcwd(), pdf_url.lstrip('/'))
+        
+        if not os.path.exists(pdf_path):
+            raise HTTPException(
+                status_code=500,
+                detail="Generated PDF file not found"
+            )
 
-        # Send email with PDF attachment
+        # Prepare email
         subject = f"Electronic Health Record - {child['first_name']} {child['last_name']}"
         body = f"""
-        Dear Dr. {current_provider['provider_name']},
+        Dear {current_provider['provider_name']},
 
         Please find attached the Electronic Health Record for {child['first_name']} {child['last_name']}.
+        You can also view the report directly in your browser.
 
         Best regards,
-        Your Health System
+        Ask Health Team
         """
 
-        # Read PDF file
-        with open(pdf_path, "rb") as pdf_file:
-            pdf_content = pdf_file.read()
-
         # Send email with PDF attachment
-        send_email(
+        attachments = [{
+            'path': pdf_path,
+            'filename': f"EHR_{child['first_name']}_{child['last_name']}.pdf"
+        }]
+        
+        # Add email sending to background tasks
+        background_tasks.add_task(
+            send_email,
             subject=subject,
             body=body,
-            to_emails=[current_provider["email"]],
-            attachments=[{
-                "filename": f"EHR_{child['first_name']}_{child['last_name']}.pdf",
-                "content": pdf_content,
-                "content_type": "application/pdf"
-            }]
+            to_emails=[current_provider['email']],
+            attachments=attachments
         )
 
-        # Clean up
-        os.remove(pdf_path)
-
+        # Extract filename from pdf_url
+        filename = os.path.basename(pdf_url)
+        
         return {
             "status": "success",
-            "message": f"EHR has been generated and sent to {current_provider['email']}"
+            "message": f"EHR has been generated and email is being sent to {current_provider['email']}",
+            "data": {
+                "pdf_url": f"http://localhost:8000/view-pdf/{filename}",
+                "patient_name": f"{child['first_name']} {child['last_name']}"
+            }
         }
 
-    except HTTPException:
-        raise
     except Exception as e:
         print(f"Error generating and emailing EHR: {str(e)}")
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error generating and emailing EHR: {str(e)}"
         )
+
+# Add endpoint to check if PDF exists
+@app.get("/check-pdf/{filename}")
+async def check_pdf(filename: str):
+    """Check if a PDF file exists"""
+    file_path = f"static/pdfs/{filename}"
+    return {"exists": os.path.exists(file_path)}
+
+# Add endpoint to serve PDF directly
+@app.get("/view-pdf/{filename}")
+async def view_pdf(
+    filename: str,
+    current_provider: dict = Depends(get_current_provider)
+):
+    """Serve PDF file for viewing"""
+    file_path = f"static/pdfs/{filename}"
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="PDF not found")
+    
+    headers = {
+        'Content-Type': 'application/pdf',
+        'Content-Disposition': f'inline; filename="{filename}"',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    }
+    
+    return FileResponse(
+        file_path,
+        media_type="application/pdf",
+        filename=filename,
+        headers=headers
+    )
