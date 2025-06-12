@@ -53,6 +53,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from email import encoders
 from email.mime.base import MIMEBase
+import shutil
 
 # Database configuration
 DATABASE_URL = "mysql+aiomysql://root:@localhost:3306/ChildHealth"
@@ -2215,26 +2216,73 @@ async def process_agent_query(
         vaccination_record_keywords = ["has taken", "received", "administered", "given", "took", "got"]
         ehr_keywords = ["ehr", "electronic health record", "health record", "medical record", "patient record", "fetch", "get", "send", "vaccination record"]
         child_variations = ["child", "chill", "children", "kid", "patient"]
+        mmr_check_keywords = ["measles", "not vaccinated", "haven't received", "missing mmr", "has not taken"]
 
         # Clean up the query
         cleaned_query = query.lower().strip()
-        
-        # Replace common speech recognition errors
-        for variation in child_variations:
-            if variation in cleaned_query:
-                cleaned_query = cleaned_query.replace(variation, "child")
-                break
 
-        # Extract SSN and vaccine information
-        ssn_pattern = r"ssn\s*(\d{4})"
-        vaccine_pattern = r"vaccination\s*([\w\s-]+?)(?:\s+(?:vaccine|vaccination|shot|dose))?\s*(?:dose\s+(\d+))?\s*today"
-        
-        ssn_match = re.search(ssn_pattern, cleaned_query)
-        vaccine_match = re.search(vaccine_pattern, cleaned_query)
+        # Check for MMR/measles vaccination query
+        is_mmr_query = (
+            ("mmr" in cleaned_query or "measles" in cleaned_query) and
+            not any(kw in cleaned_query for kw in vaccination_record_keywords)
+        )
+
+        if is_mmr_query and current_provider:
+            # Query to find children assigned to the provider who haven't received MMR vaccination
+            query = """
+            SELECT DISTINCT 
+                c.child_id,
+                c.first_name,
+                c.last_name,
+                c.date_of_birth,
+                c.email
+            FROM Children c
+            LEFT JOIN VaccinationTakenRecords vtr 
+                ON c.child_id = vtr.child_id 
+                AND vtr.vaccine_name = 'MMR'
+            WHERE c.provider_id = :provider_id
+            AND vtr.record_id IS NULL
+            ORDER BY c.last_name, c.first_name;
+            """
+            
+            unvaccinated_children = await database.fetch_all(
+                query=query,
+                values={"provider_id": current_provider["provider_id"]}
+            )
+            
+            if unvaccinated_children:
+                response_text = ["\n🚨 Clients Missing MMR Vaccination:"]
+                for child in unvaccinated_children:
+                    dob = datetime.strptime(child["date_of_birth"].strftime('%Y-%m-%d'), '%Y-%m-%d')
+                    age_months = (datetime.now() - dob).days // 30
+                    response_text.append(f"• {child['first_name']} {child['last_name']} (Age: {age_months} months)")
+                    if child["email"]:
+                        response_text.append(f"  Contact: {child['email']}")
+            else:
+                response_text = ["\nAll your clients have received their MMR vaccination."]
+            
+            return {
+                "message": "\n".join(response_text),
+                "type": "mmr_check",
+                "data": {
+                    "unvaccinated_children": [
+                        {
+                            "name": f"{child['first_name']} {child['last_name']}",
+                            "age_months": (datetime.now() - datetime.strptime(child["date_of_birth"].strftime('%Y-%m-%d'), '%Y-%m-%d')).days // 30,
+                            "email": child["email"]
+                        }
+                        for child in unvaccinated_children
+                    ]
+                }
+            }
+
+        # Handle vaccination recording
+        ssn_match = re.search(r"(?:with|ssn|client|patient)\s*(?:the|ssn|number|#)?\s*(\d{4})", cleaned_query)
+        vaccine_match = re.search(r"(?:vaccination|vaccine)?\s*(mmr|measles|mumps|rubella)\s*(?:vaccination|vaccine)?", cleaned_query, re.IGNORECASE)
 
         if ssn_match and vaccine_match:
             ssn = ssn_match.group(1)
-            vaccine_name = vaccine_match.group(1).strip().upper()
+            vaccine_name = "MMR"  # Standardize to MMR
             dose_number = 1  # Default to dose 1 if not specified
             
             # Check if child exists and belongs to the current provider
@@ -3201,44 +3249,125 @@ def convert_date_to_mysql_format(date_str):
         raise
 
 def parse_text_to_data(text):
+    """Parse extracted text to structured data"""
     data = {}
-    try:
-        data['first_name'] = re.search(r"First Name:\s*(.*)", text).group(1).strip()
-        data['last_name'] = re.search(r"Last Name:\s*(.*)", text).group(1).strip()
-        
-        # Add SSN extraction (4 digits)
-        ssn_match = re.search(r"SSN:\s*(\d{4})", text)
-        if not ssn_match:
-            raise ValueError("SSN not found or invalid format (must be 4 digits)")
-        data['ssn'] = ssn_match.group(1).strip()
-        
-        dob_match = re.search(r"Date of Birth:\s*(.*)", text)
-        if dob_match:
-            date_str = dob_match.group(1).strip()
-            data['dob'] = convert_date_to_mysql_format(date_str)
-        
-        data['gender'] = re.search(r"Gender:\s*(.*)", text).group(1).strip()
-        data['blood_type'] = re.search(r"Blood Type:\s*(.*)", text).group(1).strip()
-        data['pincode'] = re.search(r"Pincode:\s*(.*)", text).group(1).strip()
-        data['email'] = re.search(r"Email:\s*(.*)", text).group(1).strip()
-        data['vaccine_name'] = re.search(r"Vaccine Name:\s*(.*)", text).group(1).strip()
-        data['dose_number'] = int(re.search(r"Dose Number:\s*(\d+)", text).group(1).strip())
-        
-        date_admin_match = re.search(r"Date Administered:\s*(.*)", text)
-        if date_admin_match:
-            date_str = date_admin_match.group(1).strip()
-            data['date_administered'] = convert_date_to_mysql_format(date_str)
-            
-        data['administered_by'] = re.search(r"Administered By:\s*(.*)", text).group(1).strip()
-        data['reminder_sent'] = 1 if "Yes" in re.search(r"Reminder Sent:\s*(.*)", text).group(1).strip() else 0
-        data['notes'] = re.search(r"Notes:\s*(.*)", text).group(1).strip()
+    
+    # Extract First Name
+    first_name_match = re.search(r"First Name:\s*([^\n]+)", text)
+    if first_name_match:
+        data['first_name'] = first_name_match.group(1).strip()
+    else:
+        raise ValueError("First Name is required")
 
-        return data
-    except (AttributeError, ValueError) as e:
-        print(f"Error parsing data: {e}")
-        print("Raw text from PDF:")
-        print(text)
-        raise
+    # Extract Last Name from Name field
+    name_match = re.search(r"Last Name:\s*([^\n]+)", text)
+    if name_match:
+        data['last_name'] = name_match.group(1).strip()
+    else:
+        raise ValueError("Last Name is required")
+
+    # Extract DOB
+    dob_match = re.search(r"Date of Birth:\s*([^\n]+)", text)
+    if dob_match:
+        dob_str = dob_match.group(1).strip()
+        try:
+            dob_date = datetime.strptime(dob_str, "%B %d, %Y")
+            data['date_of_birth'] = dob_date.strftime("%Y-%m-%d")
+        except ValueError:
+            raise ValueError("Invalid Date of Birth format. Expected format: Month DD, YYYY")
+    else:
+        raise ValueError("Date of Birth is required")
+
+    # Extract Gender
+    gender_match = re.search(r"Gender:\s*([^\n]+)", text)
+    if gender_match:
+        data['gender'] = gender_match.group(1).strip()
+    else:
+        raise ValueError("Gender is required")
+
+    # Extract Parent ID
+    parent_id_match = re.search(r"Parent ID:\s*(\d+)", text)
+    if parent_id_match:
+        try:
+            data['parent_id'] = int(parent_id_match.group(1).strip())
+        except ValueError:
+            data['parent_id'] = None
+    else:
+        data['parent_id'] = None
+
+    # Extract Blood Type
+    blood_type_match = re.search(r"Blood Type:\s*([^\n]+)", text)
+    if blood_type_match:
+        data['blood_type'] = blood_type_match.group(1).strip()
+    else:
+        # Try alternate format where O- might be split across lines
+        blood_type_line = re.search(r"([ABO][-+])[^\n]*", text)
+        if blood_type_line:
+            data['blood_type'] = blood_type_line.group(1).strip()
+        else:
+            raise ValueError("Blood Type is required")
+
+    # Extract Pincode
+    pincode_match = re.search(r"Pincode:\s*([^\n]+)", text)
+    if pincode_match:
+        data['pincode'] = pincode_match.group(1).strip()
+    else:
+        raise ValueError("Pincode is required")
+
+    # Extract Email
+    email_match = re.search(r"Email:\s*([^\n]+)", text)
+    if email_match:
+        data['email'] = email_match.group(1).strip()
+    else:
+        raise ValueError("Email is required")
+
+    # Extract SSN
+    ssn_match = re.search(r"SSN:\s*([^\n]+)", text)
+    if ssn_match:
+        data['ssn'] = ssn_match.group(1).strip()
+    else:
+        raise ValueError("SSN is required")
+
+    # Extract Vaccination Information
+    if "Vaccination History:" in text:
+        # Extract Vaccine Name
+        vaccine_name_match = re.search(r"Vaccine Name:\s*([^\n]+)", text)
+        if vaccine_name_match:
+            data['vaccination'] = vaccine_name_match.group(1).strip()
+            
+            # Extract Dose Number
+            dose_match = re.search(r"Dose Number:\s*(\d+)", text)
+            if dose_match:
+                data['dose_number'] = int(dose_match.group(1))
+            
+            # Extract Date Administered
+            date_admin_match = re.search(r"Date Administered:\s*([^\n]+)", text)
+            if date_admin_match:
+                date_str = date_admin_match.group(1).strip()
+                try:
+                    # Handle date format "January 1, 2023"
+                    admin_date = datetime.strptime(date_str, "%B %d, %Y")
+                    data['vaccination_date'] = admin_date.strftime("%Y-%m-%d")
+                except ValueError:
+                    data['vaccination_date'] = datetime.now().strftime("%Y-%m-%d")
+            
+            # Extract Administered By
+            admin_by_match = re.search(r"Administered By:\s*([^\n]+)", text)
+            if admin_by_match:
+                data['administered_by'] = admin_by_match.group(1).strip()
+            
+            # Extract Reminder Sent
+            reminder_match = re.search(r"Reminder Sent:\s*([^\n]+)", text)
+            if reminder_match:
+                data['reminder_sent'] = 1 if reminder_match.group(1).strip().lower() == 'yes' else 0
+            
+            # Extract Notes
+            notes_match = re.search(r"Notes:\s*([^\n]+)", text)
+            if notes_match:
+                data['notes'] = notes_match.group(1).strip()
+
+    print("Parsed data:", data)  # Debug print
+    return data
 
 def generate_username_password(first_name, last_name):
     username = first_name.lower() + '.' + last_name.lower() + str(random.randint(1000, 9999))
@@ -3278,76 +3407,98 @@ async def upload_client_pdf(
     pdf_file: UploadFile = File(...),
     current_provider: dict = Depends(get_current_provider)
 ):
+    """Upload a PDF file containing client information"""
     try:
-        # Create a temporary file to store the uploaded PDF
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as temp_pdf:
-            content = await pdf_file.read()
-            temp_pdf.write(content)
-            temp_pdf_path = temp_pdf.name
-
-        try:
-            # Extract and parse data from PDF
-            text = extract_text_from_pdf(temp_pdf_path)
-            data = parse_text_to_data(text)
-            print(data)
-            
-            # Check if child with this SSN exists in the database
-            check_ssn_query = "SELECT ssn FROM Children WHERE ssn = :ssn"
-            existing_ssn = await database.fetch_one(check_ssn_query, values={"ssn": int(data['ssn'])})
-            print(existing_ssn)
-            
-            if existing_ssn:
-                print("Child already exists")
-                return {
-                    "status": "exists",
-                    "message": "The child is already present in your records."
-                }
-
-            # If SSN not found, proceed with adding new record
-            # Generate username and password
-            username, password = generate_username_password(data["first_name"], data["last_name"])
-            hashed_password = hash_password(password)
-
-            # Insert new child with provider_id
-            insert_query = """
-            INSERT INTO Children (
-                first_name, last_name, date_of_birth, gender,
-                blood_type, pincode, email, username, password_hash,
-                ssn, provider_id
+        # Save uploaded file temporarily
+        temp_dir = tempfile.mkdtemp()
+        pdf_path = os.path.join(temp_dir, pdf_file.filename)
+        
+        with open(pdf_path, "wb") as buffer:
+            shutil.copyfileobj(pdf_file.file, buffer)
+        
+        # Extract text from PDF
+        text = extract_text_from_pdf(pdf_path)
+        print("Extracted text:", text)  # Debug print
+        
+        # Parse text to data
+        data = parse_text_to_data(text)
+        print("Parsed data:", data)  # Debug print
+        
+        # Insert into Children table
+        query = """
+        INSERT INTO Children (
+            first_name, last_name, date_of_birth, gender,
+            blood_type, pincode, email, ssn, provider_id,
+            parent_id
+        ) VALUES (
+            :first_name, :last_name, :date_of_birth, :gender,
+            :blood_type, :pincode, :email, :ssn, :provider_id,
+            :parent_id
+        )
+        """
+        
+        values = {
+            "first_name": data["first_name"],
+            "last_name": data["last_name"],
+            "date_of_birth": data["date_of_birth"],
+            "gender": data["gender"],
+            "blood_type": data["blood_type"],
+            "pincode": data["pincode"],
+            "email": data["email"],
+            "ssn": data["ssn"],
+            "provider_id": current_provider["provider_id"],
+            "parent_id": data.get("parent_id")
+        }
+        
+        result = await database.execute(query, values)
+        child_id = result  # Get the auto-generated child_id
+        
+        # If vaccination information is present, record it
+        if "vaccination" in data:
+            print("Inserting vaccination record:", data)  # Debug print
+            vaccination_query = """
+            INSERT INTO VaccinationTakenRecords (
+                child_id, vaccine_name, dose_number,
+                date_administered, administered_by,
+                reminder_sent, notes
             ) VALUES (
-                :first_name, :last_name, :dob, :gender,
-                :blood_type, :pincode, :email, :username, :password_hash,
-                :ssn, :provider_id
+                :child_id, :vaccine_name, :dose_number,
+                :date_administered, :administered_by,
+                :reminder_sent, :notes
             )
             """
-            values = {
-                **data,
-                "username": username,
-                "password_hash": hashed_password,
-                "provider_id": current_provider["provider_id"]
+            
+            vaccination_values = {
+                "child_id": child_id,
+                "vaccine_name": data["vaccination"],
+                "dose_number": data.get("dose_number", 1),
+                "date_administered": data.get("vaccination_date", datetime.now().date()),
+                "administered_by": data.get("administered_by", current_provider["provider_name"]),
+                "reminder_sent": data.get("reminder_sent", 0),
+                "notes": data.get("notes", "Added via PDF upload")
             }
             
-            await database.execute(query=insert_query, values=values)
-
-            # Send welcome email to the user
-            await send_credentials_to_user(data["email"], username, password)
-
-            return {
-                "status": "success",
-                "message": "New child record has been successfully added to the database."
-            }
-
-        except Exception as e:
-            print(f"Error processing PDF: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
-        finally:
-            # Clean up temporary file
-            if os.path.exists(temp_pdf_path):
-                os.remove(temp_pdf_path)
-
+            await database.execute(vaccination_query, vaccination_values)
+        
+        # Clean up
+        shutil.rmtree(temp_dir)
+        
+        return {
+            "status": "success",
+            "message": f"Successfully added client {data['first_name']} {data['last_name']} with vaccination record",
+            "child_id": child_id
+        }
+        
+    except ValueError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Error processing PDF: {str(e)}"
+        )
     except Exception as e:
-        print(f"Error uploading PDF: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing PDF: {str(e)}"
+        )
 
 # Add middleware to ensure database connection
 @app.middleware("http")
